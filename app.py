@@ -79,6 +79,8 @@ def create_tables():
                 username TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
+                user_type TEXT NOT NULL DEFAULT 'free',
+                is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -128,6 +130,21 @@ def migrate_database():
             print("✅ urls 테이블 마이그레이션이 완료되었습니다.")
         else:
             print("✅ urls 테이블이 이미 최신 스키마입니다.")
+        
+        # users 테이블에 user_type, is_active 컬럼이 있는지 확인
+        cursor = conn.execute("PRAGMA table_info(users)")
+        user_columns = {column[1] for column in cursor.fetchall()}
+        
+        if 'user_type' not in user_columns:
+            print("🔄 users 테이블에 user_type 컬럼을 추가하는 중...")
+            conn.execute("ALTER TABLE users ADD COLUMN user_type TEXT NOT NULL DEFAULT 'free'")
+            conn.commit()
+            print("✅ users.user_type 마이그레이션 완료")
+        if 'is_active' not in user_columns:
+            print("🔄 users 테이블에 is_active 컬럼을 추가하는 중...")
+            conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+            conn.commit()
+            print("✅ users.is_active 마이그레이션 완료")
             
     except Exception as e:
         print(f"❌ 마이그레이션 오류: {e}")
@@ -160,7 +177,7 @@ def get_current_user():
     conn = get_db_connection()
     try:
         user = conn.execute('''
-            SELECT id, username, email, created_at 
+            SELECT id, username, email, user_type, is_active, created_at 
             FROM users 
             WHERE id = ? 
             LIMIT 1
@@ -830,6 +847,15 @@ def shorten_url():
         
         # URL 단축 서비스 호출 (user_id 포함)
         user_id = session.get('user_id') if session.get('logged_in') else None
+
+        # (2-7단계) 무료 사용자 월 한도 체크
+        if user_id:
+            allowed, msg, used, limit_total = can_create_url(user_id)
+            if not allowed:
+                if is_form_request:
+                    return redirect(f"/?error={msg}")
+                else:
+                    return jsonify({'success': False, 'error': msg, 'error_code': 'PLAN_LIMIT_REACHED'}), 403
         result = shorten_url_service(original_url, user_id)
         
         if is_form_request:
@@ -1013,6 +1039,10 @@ def dashboard():
     total_clicks = sum(url['click_count'] for url in user_urls) if user_urls else 0
     active_urls = len([url for url in user_urls if url['click_count'] > 0]) if user_urls else 0
     created_at = current_user['created_at'][:10] if current_user['created_at'] else 'N/A'
+    # (2-7단계) 이번 달 사용량
+    used_this_month = count_user_urls_this_month(current_user['id'])
+    limit_total, is_unlimited = get_user_limit_info(current_user)
+    usage_text = (f"이번 달 {used_this_month}/{limit_total}개 사용 중" if not is_unlimited else "프리미엄(무제한)")
     
     print(f"📈 통계: 총 URL {total_urls}, 총 클릭 {total_clicks}, 활성 URL {active_urls}, 가입일 {created_at}")
     
@@ -1023,7 +1053,8 @@ def dashboard():
         total_urls=total_urls,
         total_clicks=total_clicks,
         active_urls=active_urls,
-        url_list=url_list_html
+        url_list=url_list_html,
+        usage_text=usage_text
     )
     
     return dashboard_html
@@ -1119,6 +1150,47 @@ def profile():
         
         elif action == 'delete_account':
             confirm_password = request.form.get('confirm_password', '')
+        elif action == 'change_email':
+            new_email = request.form.get('new_email', '').strip()
+            if not new_email or '@' not in new_email or '.' not in new_email:
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error_message}', '<div class="error-message">⚠️ 올바른 이메일을 입력해주세요.</div>')
+            # 이메일 중복 체크 및 업데이트
+            conn = get_db_connection()
+            try:
+                exists = conn.execute('SELECT id FROM users WHERE email = ? AND id != ?', (new_email, current_user['id'])).fetchone()
+                if exists:
+                    profile_html = PROFILE_HTML.format(
+                        username=current_user['username'],
+                        email=current_user['email'],
+                        created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                    )
+                    return profile_html.replace('{error_message}', '<div class="error-message">⚠️ 이미 사용 중인 이메일입니다.</div>')
+                conn.execute('UPDATE users SET email = ? WHERE id = ?', (new_email, current_user['id']))
+                conn.commit()
+                session['email'] = new_email
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=new_email,
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{success_message}', '<div class="success-message">✅ 이메일이 변경되었습니다.</div>')
+            finally:
+                conn.close()
+        elif action == 'deactivate_account':
+            # 계정 비활성화 (로그인 불가)
+            conn = get_db_connection()
+            try:
+                conn.execute('UPDATE users SET is_active = 0 WHERE id = ?', (current_user['id'],))
+                conn.commit()
+            finally:
+                conn.close()
+            session.clear()
+            return redirect('/?message=계정이 비활성화되었습니다.')
             
             # 비밀번호 확인
             success, user = verify_user_credentials(current_user['username'], confirm_password)
@@ -3665,8 +3737,8 @@ def create_user(username, email, password):
     try:
         password_hash = generate_password_hash(password)
         conn.execute('''
-            INSERT INTO users (username, email, password_hash) 
-            VALUES (?, ?, ?)
+            INSERT INTO users (username, email, password_hash, user_type, is_active) 
+            VALUES (?, ?, ?, 'free', 1)
         ''', (username, email, password_hash))
         conn.commit()
         return True, "사용자가 성공적으로 생성되었습니다."
@@ -3682,7 +3754,7 @@ def get_user_by_username(username):
     conn = get_db_connection()
     try:
         user = conn.execute('''
-            SELECT id, username, email, password_hash, created_at 
+            SELECT id, username, email, password_hash, user_type, is_active, created_at 
             FROM users 
             WHERE username = ? 
             LIMIT 1
@@ -3699,7 +3771,7 @@ def get_user_by_email(email):
     conn = get_db_connection()
     try:
         user = conn.execute('''
-            SELECT id, username, email, password_hash, created_at 
+            SELECT id, username, email, password_hash, user_type, is_active, created_at 
             FROM users 
             WHERE email = ? 
             LIMIT 1
@@ -3718,10 +3790,64 @@ def verify_user_credentials(username_or_email, password):
     if not user:
         user = get_user_by_email(username_or_email)
     
-    if user and check_password_hash(user['password_hash'], password):
-        return True, user
+    if user:
+        # sqlite3.Row은 dict.get을 지원하지 않으므로 안전하게 처리
+        try:
+            user_keys = set(user.keys()) if hasattr(user, 'keys') else set()
+        except Exception:
+            user_keys = set()
+        is_active = user['is_active'] if 'is_active' in user_keys else 1
+        if is_active and check_password_hash(user['password_hash'], password):
+            return True, user
+        else:
+            return False, None
     else:
         return False, None
+
+# =====================================
+# 사용자 등급/제한 관련 유틸 (2-7단계)
+# =====================================
+
+def count_user_urls_this_month(user_id):
+    """해당 사용자가 이번 달에 생성한 URL 수를 반환"""
+    conn = get_db_connection()
+    try:
+        count = conn.execute('''
+            SELECT COUNT(*) FROM urls
+            WHERE user_id = ?
+              AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+        ''', (user_id,)).fetchone()[0]
+        return int(count)
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+def get_user_limit_info(user_row):
+    """사용자 등급에 따른 월 한도 정보를 반환 (limit_total, is_unlimited)"""
+    user_type = (user_row['user_type'] if isinstance(user_row, sqlite3.Row) else user_row.get('user_type')) if user_row else 'free'
+    if user_type in ('premium', 'admin'):
+        return None, True
+    return 10, False
+
+def can_create_url(user_id):
+    """URL 생성 가능 여부와 메시지를 반환"""
+    conn = get_db_connection()
+    try:
+        user = conn.execute('SELECT id, username, user_type, is_active FROM users WHERE id = ? LIMIT 1', (user_id,)).fetchone()
+        if not user:
+            return False, '사용자 정보를 찾을 수 없습니다.', 0, 10
+        if not user['is_active']:
+            return False, '비활성화된 계정입니다.', 0, 10
+        limit_total, is_unlimited = get_user_limit_info(user)
+        used = count_user_urls_this_month(user_id)
+        if is_unlimited:
+            return True, '', used, None
+        if used >= limit_total:
+            return False, f"무료 플랜 월 {limit_total}개 생성 한도에 도달했습니다. 프로필에서 프리미엄으로 업그레이드하세요.", used, limit_total
+        return True, '', used, limit_total
+    finally:
+        conn.close()
 
 def get_user_urls(user_id):
     """특정 사용자의 URL 목록을 조회하는 함수"""
@@ -4506,7 +4632,7 @@ DASHBOARD_HTML = '''
         <div class="content">
             <div class="welcome-section">
                 <div class="welcome-title">🥩 Cutlet 대시보드</div>
-                <div class="welcome-subtitle">당신의 URL 단축 서비스 현황을 확인하세요</div>
+                <div class="welcome-subtitle">당신의 URL 단축 서비스 현황을 확인하세요 • {usage_text}</div>
             </div>
             
             <div class="stats-grid">
@@ -4910,6 +5036,20 @@ PROFILE_HTML = '''
                     삭제하면 모든 데이터가 영구적으로 사라집니다.
                 </p>
                 
+                <form method="POST" action="/profile" style="margin-bottom:20px">
+                    <input type="hidden" name="action" value="change_email">
+                    <div class="form-group">
+                        <label for="new_email" class="form-label">이메일 변경</label>
+                        <input type="email" id="new_email" name="new_email" class="form-input" placeholder="새 이메일을 입력하세요" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">✉️ 이메일 변경</button>
+                </form>
+
+                <form method="POST" action="/profile" onsubmit="return confirm('계정을 비활성화하시겠습니까? 다시 로그인하려면 관리자에게 문의가 필요할 수 있습니다.')" style="margin-bottom:20px">
+                    <input type="hidden" name="action" value="deactivate_account">
+                    <button type="submit" class="btn btn-danger">🚫 계정 비활성화</button>
+                </form>
+
                 <form method="POST" action="/profile" onsubmit="return confirmDelete()">
                     <input type="hidden" name="action" value="delete_account">
                     
