@@ -4,12 +4,52 @@ import datetime
 import os
 import random
 import time
+import threading
+import logging
+from collections import defaultdict, deque
+from config import get_config
 
 # Flask 애플리케이션 인스턴스 생성
 app = Flask(__name__)
 
-# 데이터베이스 설정
-DATABASE = 'cutlet.db'
+# 환경별 설정 적용 (1-10단계)
+config_class = get_config()
+app.config.from_object(config_class)
+
+# 데이터베이스 설정 (환경 변수 기반)
+DATABASE = app.config['DATABASE_PATH']
+
+# 성능 최적화 및 보안 강화 설정 (1-9단계, 1-10단계 환경 변수화)
+# Rate limiting: IP별 요청 제한
+RATE_LIMIT_PER_MINUTE = app.config['RATE_LIMIT_PER_MINUTE']
+request_counts = defaultdict(deque)  # IP별 요청 시간을 저장
+rate_limit_lock = threading.Lock()
+
+# 캐싱: 인기 URL 빠른 응답
+URL_CACHE = {}  # short_code -> original_url 캐싱
+CACHE_MAX_SIZE = app.config['CACHE_MAX_SIZE']
+cache_lock = threading.Lock()
+
+# 로그 설정 (환경 변수 기반)
+log_level = getattr(logging, app.config['LOG_LEVEL'], logging.INFO)
+log_file = app.config['LOG_FILE']
+
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
+
+# Flask 앱 시작 로그
+logging.info("🥩 Cutlet URL Shortener starting...")
+logging.info(f"Environment: {os.environ.get('FLASK_ENV', 'development')}")
+logging.info(f"Debug mode: {app.config['DEBUG']}")
+logging.info(f"Database: {DATABASE}")
+logging.info(f"Rate limit: {RATE_LIMIT_PER_MINUTE}/min")
+logging.info(f"Cache size: {CACHE_MAX_SIZE}")
 
 # 데이터베이스 연결 함수
 def get_db_connection():
@@ -20,9 +60,10 @@ def get_db_connection():
 
 # 데이터베이스 테이블 생성 함수
 def create_tables():
-    """urls 테이블을 생성하는 함수"""
+    """urls 테이블 및 성능 최적화 인덱스를 생성하는 함수 (1-9단계)"""
     conn = get_db_connection()
     try:
+        # urls 테이블 생성
         conn.execute('''
             CREATE TABLE IF NOT EXISTS urls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,8 +73,15 @@ def create_tables():
                 click_count INTEGER DEFAULT 0
             )
         ''')
+        
+        # 성능 최적화를 위한 인덱스 추가 (1-9단계)
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_short_code ON urls(short_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_original_url ON urls(original_url)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_click_count ON urls(click_count DESC)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON urls(created_at)')
+        
         conn.commit()
-        print("✅ urls 테이블이 성공적으로 생성되었습니다.")
+        print("✅ urls 테이블 및 성능 인덱스가 성공적으로 생성되었습니다.")
     except Exception as e:
         print(f"❌ 테이블 생성 오류: {e}")
     finally:
@@ -421,6 +469,43 @@ def is_valid_url(url):
     if any(char in url for char in forbidden_chars):
         return False, "URL에 허용되지 않는 문자가 포함되어 있습니다."
     
+    # 보안 강화: 악성 URL 패턴 차단 (1-9단계)
+    # 알려진 악성/스팸 도메인 패턴
+    malicious_patterns = [
+        'bit.ly', 'tinyurl.com', 'ow.ly', 't.co',  # URL 단축 서비스 체인 방지
+        'phishing', 'malware', 'virus', 'scam',    # 명백한 악성 키워드
+        'click-here', 'free-money', 'winner',      # 스팸 패턴
+        'temp-mail', 'guerrillamail', '10minutemail',  # 임시 메일 서비스
+    ]
+    
+    url_lower = url.lower()
+    for pattern in malicious_patterns:
+        if pattern in url_lower:
+            return False, f"보안상 위험한 URL 패턴이 감지되었습니다: {pattern}"
+    
+    # 위험한 파일 확장자 차단 (파일 다운로드 URL만 체크)
+    dangerous_extensions = ['.exe', '.scr', '.bat', '.cmd', '.pif', '.vbs']
+    # URL 경로에서 마지막 부분만 확인 (쿼리 파라미터 제외)
+    url_path = url_lower.split('?')[0].split('#')[0]
+    # 파일명 부분만 추출 (마지막 / 이후)
+    filename = url_path.split('/')[-1] if '/' in url_path else url_path
+    
+    # 실제 파일 확장자가 있는 경우만 체크
+    if '.' in filename and not filename.endswith('.html') and not filename.endswith('.htm'):
+        for ext in dangerous_extensions:
+            if filename.endswith(ext):
+                return False, f"보안상 위험한 파일 형식입니다: {ext}"
+    
+    # 의심스러운 포트 번호 차단 (일반적이지 않은 포트)
+    import re
+    port_match = re.search(r':(\d+)/', url)
+    if port_match:
+        port = int(port_match.group(1))
+        # 일반적인 웹 포트가 아닌 경우 차단
+        allowed_ports = [80, 443, 8080, 3000, 3001, 4000, 5000, 8000, 8888, 9000]
+        if port not in allowed_ports:
+            return False, f"허용되지 않는 포트 번호입니다: {port}"
+    
     # 기본적인 도메인 형식 확인 (점이 포함되어야 함)
     try:
         # URL에서 프로토콜 제거 후 도메인 부분만 추출
@@ -464,6 +549,41 @@ def is_valid_url(url):
     
     return True, ""
 
+# Rate Limiting 함수 (1-9단계)
+def check_rate_limit(ip_address):
+    """IP별 요청 횟수를 확인하여 rate limiting을 적용하는 함수"""
+    current_time = time.time()
+    
+    with rate_limit_lock:
+        # 1분 이상 된 요청은 제거
+        while (request_counts[ip_address] and 
+               current_time - request_counts[ip_address][0] > 60):
+            request_counts[ip_address].popleft()
+        
+        # 현재 요청 수 확인
+        if len(request_counts[ip_address]) >= RATE_LIMIT_PER_MINUTE:
+            return False, f"요청 횟수 제한을 초과했습니다. 분당 {RATE_LIMIT_PER_MINUTE}회까지 허용됩니다."
+        
+        # 현재 요청 추가
+        request_counts[ip_address].append(current_time)
+        return True, ""
+
+# 캐싱 함수들 (1-9단계)
+def get_from_cache(short_code):
+    """캐시에서 URL을 조회하는 함수"""
+    with cache_lock:
+        return URL_CACHE.get(short_code)
+
+def add_to_cache(short_code, original_url):
+    """캐시에 URL을 추가하는 함수"""
+    with cache_lock:
+        if len(URL_CACHE) >= CACHE_MAX_SIZE:
+            # 가장 오래된 항목 제거 (LRU와 유사)
+            oldest_key = next(iter(URL_CACHE))
+            del URL_CACHE[oldest_key]
+        
+        URL_CACHE[short_code] = original_url
+
 def shorten_url_service(original_url):
     """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선)"""
     
@@ -492,6 +612,10 @@ def shorten_url_service(original_url):
             base_url = request.host_url.rstrip('/')  # http://localhost:8080
             short_url = f"{base_url}/{existing['short_code']}"
             
+            # 캐시에 추가 (1-9단계)
+            add_to_cache(existing['short_code'], original_url)
+            logging.info(f"Existing URL returned and cached: {existing['short_code']} -> {original_url[:50]}...")
+            
             return {
                 'success': True,
                 'original_url': original_url,
@@ -516,6 +640,10 @@ def shorten_url_service(original_url):
             # 단축 URL 생성
             base_url = request.host_url.rstrip('/')  # http://localhost:8080
             short_url = f"{base_url}/{short_code}"
+            
+            # 캐시에 추가 (1-9단계)
+            add_to_cache(short_code, original_url)
+            logging.info(f"New URL created and cached: {short_code} -> {original_url[:50]}...")
             
             return {
                 'success': True,
@@ -547,7 +675,26 @@ def shorten_url_service(original_url):
 # URL 단축 API/폼 엔드포인트 (1-3, 1-5단계)
 @app.route('/shorten', methods=['POST'])
 def shorten_url():
-    """URL을 단축하는 API/폼 엔드포인트"""
+    """URL을 단축하는 API/폼 엔드포인트 (1-9단계 보안 강화)"""
+    
+    # Rate limiting 체크 (1-9단계)
+    client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+    if client_ip:
+        client_ip = client_ip.split(',')[0].strip()  # 프록시 환경에서 실제 IP 추출
+    else:
+        client_ip = request.remote_addr
+    
+    rate_ok, rate_error = check_rate_limit(client_ip)
+    if not rate_ok:
+        logging.warning(f"Rate limit exceeded for IP: {client_ip}")
+        if request.is_json:
+            return jsonify({
+                'success': False,
+                'error': rate_error,
+                'error_code': 'RATE_LIMIT_EXCEEDED'
+            }), 429
+        else:
+            return redirect(f'/?error={rate_error}')
     
     try:
         # 요청 데이터 가져오기
@@ -573,6 +720,9 @@ def shorten_url():
                     'error': 'original_url is required',
                     'error_code': 'MISSING_URL'
                 }), 400
+        
+        # 로깅: 요청 기록 (1-9단계)
+        logging.info(f"URL shortening request from {client_ip}: {original_url[:100]}...")
         
         # URL 단축 서비스 호출
         result = shorten_url_service(original_url)
@@ -1457,12 +1607,25 @@ def redirect_to_original(short_code):
             print(f"⚠️ 허용되지 않는 문자가 포함된 단축 코드: {short_code}")
             abort(404)
         
-        # 데이터베이스에서 URL 조회
+        # 캐시에서 먼저 확인 (1-9단계 성능 최적화)
+        cached_url = get_from_cache(short_code)
+        if cached_url:
+            logging.info(f"Cache hit for {short_code} -> {cached_url}")
+            # 캐시에서 찾은 경우에도 클릭 수는 업데이트
+            update_click_count(short_code)
+            return redirect(cached_url)
+        
+        # 캐시에 없으면 데이터베이스에서 URL 조회
         url_data = get_url_by_short_code(short_code)
         
         if url_data is None:
+            logging.warning(f"Invalid short code requested: {short_code}")
             print(f"⚠️ 존재하지 않는 단축 코드: {short_code}")
             abort(404)
+        
+        # 조회된 URL을 캐시에 저장
+        original_url = url_data['original_url']
+        add_to_cache(short_code, original_url)
         
         # 클릭 수 업데이트
         update_success = update_click_count(short_code)
@@ -1472,8 +1635,8 @@ def redirect_to_original(short_code):
             print(f"⚠️ 클릭 수 업데이트 실패: {short_code}")
         
         # 원본 URL로 리다이렉트
-        original_url = url_data['original_url']
         print(f"🔄 리다이렉트: {short_code} -> {original_url}")
+        logging.info(f"Redirect: {short_code} -> {original_url}")
         
         return redirect(original_url)
         
@@ -2882,5 +3045,13 @@ if __name__ == '__main__':
     # 앱 시작 시 데이터베이스 초기화
     init_database()
     
-    # 디버그 모드로 실행 (개발 단계에서만 사용)
-    app.run(debug=True, host='0.0.0.0', port=8080)
+    # 환경 변수 기반 서버 실행 (1-10단계)
+    host = app.config['HOST']
+    port = app.config['PORT']
+    debug = app.config['DEBUG']
+    
+    logging.info(f"🚀 Starting Cutlet server on {host}:{port}")
+    logging.info(f"🥩 Cut your links, serve them fresh!")
+    
+    # 개발 환경에서는 Flask 내장 서버, 프로덕션에서는 Gunicorn 권장
+    app.run(debug=debug, host=host, port=port)
