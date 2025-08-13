@@ -126,6 +126,23 @@ def create_tables():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_click_short_code ON click_events(short_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_click_created_at ON click_events(created_at)')
 
+        # 광고 노출 로그 (3-5단계)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS ad_impressions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_id INTEGER,
+                short_code TEXT NOT NULL,
+                viewer_user_id INTEGER,
+                ip TEXT,
+                referrer TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (url_id) REFERENCES urls (id) ON DELETE CASCADE,
+                FOREIGN KEY (viewer_user_id) REFERENCES users (id) ON DELETE SET NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_adimp_short_code ON ad_impressions(short_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_adimp_created_at ON ad_impressions(created_at)')
+
         # 결제/구독 기반 테이블 (3-4단계)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS payments (
@@ -2539,9 +2556,17 @@ def redirect_to_original(short_code):
         cached_url = get_from_cache(short_code)
         if cached_url:
             logging.info(f"Cache hit for {short_code} -> {cached_url}")
-            # 캐시에서 찾은 경우에도 클릭 수는 업데이트
-            update_click_count(short_code)
-            return redirect(cached_url)
+            # 프리미엄은 바로 이동, 무료는 광고 페이지로 이동
+            user = get_current_user()
+            if user and user['user_type'] in ('premium','admin'):
+                update_click_count(short_code)
+                try:
+                    log_click_event(short_code, request)
+                except Exception:
+                    pass
+                return redirect(cached_url)
+            else:
+                return redirect(url_for('ads_page', short_code=short_code))
         
         # 캐시에 없으면 데이터베이스에서 URL 조회
         url_data = get_url_by_short_code(short_code)
@@ -2555,22 +2580,17 @@ def redirect_to_original(short_code):
         original_url = url_data['original_url']
         add_to_cache(short_code, original_url)
         
-        # 클릭 수 업데이트 및 상세 클릭 이벤트 기록 (3-2단계)
-        update_success = update_click_count(short_code)
-        try:
-            log_click_event(short_code, request)
-        except Exception as _:
-            pass
-        if update_success:
-            print(f"✅ 클릭 수 업데이트 성공: {short_code} -> 클릭 수: {url_data['click_count'] + 1}")
+        # 프리미엄은 바로 이동, 무료는 광고 페이지로 이동
+        user = get_current_user()
+        if user and user['user_type'] in ('premium','admin'):
+            update_success = update_click_count(short_code)
+            try:
+                log_click_event(short_code, request)
+            except Exception:
+                pass
+            return redirect(original_url)
         else:
-            print(f"⚠️ 클릭 수 업데이트 실패: {short_code}")
-        
-        # 원본 URL로 리다이렉트
-        print(f"🔄 리다이렉트: {short_code} -> {original_url}")
-        logging.info(f"Redirect: {short_code} -> {original_url}")
-        
-        return redirect(original_url)
+            return redirect(url_for('ads_page', short_code=short_code))
         
     except Exception as e:
         print(f"❌ 리다이렉트 오류: {e}")
@@ -3496,7 +3516,7 @@ def main_page():
     </body>
     </html>
     '''
-    
+
     # error_html과 success_html을 body 시작 부분에 삽입
     if error_html or success_html:
         body_start = '<body>'
@@ -3506,8 +3526,82 @@ def main_page():
         if success_html:
             body_content += success_html + '\n        '
         html_content = html_content.replace(body_start, body_content)
-    
+
     return html_content
+
+# =====================================
+# 3-5단계: 광고 리다이렉트 페이지 (무료 사용자용)
+# =====================================
+
+@app.route('/ads/<short_code>')
+def ads_page(short_code):
+    url = get_url_by_short_code(short_code)
+    if not url:
+        abort(404)
+    original_url = url['original_url']
+    # 광고 노출 기록
+    conn = get_db_connection()
+    try:
+        url_row = conn.execute('SELECT id FROM urls WHERE short_code = ?', (short_code,)).fetchone()
+        viewer_user_id = session.get('user_id') if session.get('logged_in') else None
+        ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if ip:
+            ip = ip.split(',')[0].strip()
+        ref = request.headers.get('Referer', '')
+        conn.execute('INSERT INTO ad_impressions (url_id, short_code, viewer_user_id, ip, referrer) VALUES (?, ?, ?, ?, ?)', (url_row['id'] if url_row else None, short_code, viewer_user_id, ip, ref))
+        conn.commit()
+    finally:
+        conn.close()
+    
+    base_styles = """
+        * { box-sizing: border-box; }
+        body { font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg,#D2691E 0%,#CD853F 100%); min-height:100vh; padding:30px; }
+        .wrap { max-width:900px; margin:0 auto; background:#fff; border-radius:20px; box-shadow:0 20px 40px rgba(0,0,0,.1); overflow:hidden; }
+        .header { background: linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff; padding:24px; display:flex; align-items:center; justify-content:space-between; }
+        .title { font-size:1.6rem; font-weight:700; }
+        .content { padding:24px; display:grid; grid-template-columns: 2fr 1fr; gap:18px; }
+        .ad { border:1px dashed #ddd; height:250px; display:flex; align-items:center; justify-content:center; color:#999; border-radius:10px; background:#fafafa; }
+        .sidebar .ad { height:600px; }
+        .info { color:#555; margin-top:10px; }
+        .countdown { font-weight:700; color:#D2691E; }
+        .btn { display:inline-block; padding:10px 16px; border-radius:10px; text-decoration:none; font-weight:600; }
+        .primary { background: linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff; }
+        .secondary { background:#f8f9fa; color:#D2691E; border:2px solid #D2691E; }
+        .footer { padding:18px 24px; border-top:1px solid #eee; text-align:center; }
+    """
+    original_url_repr = {repr(original_url)}
+    return f'''
+    <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>광고 - Cutlet</title>
+    <style>{base_styles}</style>
+    </head><body>
+        <div class="wrap">
+            <div class="header">
+                <div class="title">잠시 후 원본 페이지로 이동합니다</div>
+                <div>프리미엄은 광고 없이 바로 이동</div>
+            </div>
+            <div class="content">
+                <div>
+                    <div class="ad">여기에 광고가 표시됩니다 (AdSense 준비 영역 728×90 또는 970×250)</div>
+                    <p class="info">원본 페이지: <a href="{original_url}" target="_blank">{original_url}</a></p>
+                    <p class="info">광고를 제거하려면 <a href="/pricing" style="color:#D2691E; text-decoration:none; font-weight:700;">프리미엄 가입</a>을 이용하세요.</p>
+                    <p class="info">자동 이동까지 <span id="sec" class="countdown">5</span>초</p>
+                    <a id="skip" class="btn secondary" href="{original_url}" style="pointer-events:none; opacity:.6;">건너뛰기</a>
+                </div>
+                <div class="sidebar">
+                    <div class="ad">사이드 광고(300×600)</div>
+                </div>
+            </div>
+            <div class="footer">
+                <a class="btn primary" href="/checkout">프리미엄 가입하고 광고 제거</a>
+            </div>
+        </div>
+        <script>
+            let s = 5; const sec = document.getElementById('sec'); const skip = document.getElementById('skip');
+            const url = {original_url_repr};
+            const timer = setInterval(() => {{ s -= 1; sec.textContent = s; if (s <= 0) {{ clearInterval(timer); skip.style.opacity = '1'; skip.style.pointerEvents = 'auto'; window.location.href = url; }} }}, 1000);
+        </script>
+    </body></html>
+    '''
 
 # 결과 페이지 라우트 (1-5단계)
 @app.route('/result')
