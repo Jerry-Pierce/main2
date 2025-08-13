@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, redirect, abort, render_template_string, url_for, session
 import sqlite3
+import re
 import datetime
 import os
 import random
@@ -738,7 +739,7 @@ def add_to_cache(short_code, original_url):
         
         URL_CACHE[short_code] = original_url
 
-def shorten_url_service(original_url, user_id=None):
+def shorten_url_service(original_url, user_id=None, custom_code=None):
     """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선 + 2-1단계: user_id 지원, 2-6단계: 로그인 필요)"""
     
     # 로그인한 사용자만 URL 생성 가능 (2-6단계)
@@ -791,9 +792,30 @@ def shorten_url_service(original_url, user_id=None):
     finally:
         conn.close()
     
-    # 새로운 단축 코드 생성
+    # 새로운 단축 코드 생성 (프리미엄 커스텀 코드 지원)
     try:
-        short_code = generate_unique_short_code(6)  # 6글자 코드 생성
+        if custom_code:
+            # 서버 측 최종 유효성 체크 및 중복 확인
+            if not re.match(r'^[A-Za-z0-9-]{3,20}$', custom_code):
+                return {
+                    'success': False,
+                    'error': '커스텀 코드는 3-20자 영문/숫자/하이픈만 가능합니다.',
+                    'error_code': 'INVALID_CUSTOM_CODE'
+                }
+            conn = get_db_connection()
+            try:
+                exists = conn.execute('SELECT 1 FROM urls WHERE short_code = ? LIMIT 1', (custom_code,)).fetchone()
+                if exists:
+                    return {
+                        'success': False,
+                        'error': '이미 사용 중인 커스텀 코드입니다.',
+                        'error_code': 'CUSTOM_CODE_EXISTS'
+                    }
+            finally:
+                conn.close()
+            short_code = custom_code
+        else:
+            short_code = generate_unique_short_code(6)  # 6글자 코드 생성
         
         # 데이터베이스에 저장 (user_id 포함)
         success = add_url(original_url, short_code, user_id)
@@ -869,6 +891,7 @@ def shorten_url():
         else:
             # 폼 데이터 요청
             original_url = request.form.get('original_url', '').strip()
+            custom_code = request.form.get('custom_code', '').strip()
             is_form_request = True
         
         # original_url이 없으면 에러
@@ -898,7 +921,21 @@ def shorten_url():
                     return redirect(f"/?error={msg}")
                 else:
                     return jsonify({'success': False, 'error': msg, 'error_code': 'PLAN_LIMIT_REACHED'}), 403
-        result = shorten_url_service(original_url, user_id)
+        # 프리미엄 사용자만 커스텀 코드 허용
+        custom_for_service = None
+        if custom_code:
+            conn = get_db_connection()
+            try:
+                user = conn.execute('SELECT user_type FROM users WHERE id = ? LIMIT 1', (user_id,)).fetchone()
+                if user and user['user_type'] in ('premium','admin'):
+                    custom_for_service = custom_code
+                else:
+                    # 무료 사용자는 안내 메시지
+                    return redirect('/pricing?message=커스텀 URL은 프리미엄 전용 기능입니다.')
+            finally:
+                conn.close()
+
+        result = shorten_url_service(original_url, user_id, custom_for_service)
         
         if is_form_request:
             # 폼 요청의 경우 결과 페이지로 리다이렉트
@@ -3103,6 +3140,19 @@ def main_page():
                         pattern="https?://.*"
                         title="URL은 http:// 또는 https://로 시작해야 합니다"
                     >
+                </div>
+                <div class="form-group">
+                    <label for="custom_code" class="form-label">원하는 URL로 설정 (프리미엄)</label>
+                    <input 
+                        type="text"
+                        id="custom_code"
+                        name="custom_code"
+                        class="url-input"
+                        placeholder="예: my-awesome-link"
+                        pattern="[A-Za-z0-9-]{3,20}"
+                        title="3-20자 영문/숫자/하이픈만 허용"
+                    >
+                    <div style="font-size:0.9rem;color:#888;margin-top:6px;">예: cutlet.me/my-awesome-link • 무료 사용자는 <a href="/pricing" style="color:#D2691E; text-decoration:none;">프리미엄 업그레이드</a> 후 이용 가능합니다.</div>
                 </div>
                 
                 <button type="submit" class="submit-btn" id="submitBtn">
