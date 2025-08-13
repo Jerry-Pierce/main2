@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect, abort, render_template_string, url_for
+from flask import Flask, request, jsonify, redirect, abort, render_template_string, url_for, session
 import sqlite3
 import datetime
 import os
@@ -7,6 +7,7 @@ import time
 import threading
 import logging
 from collections import defaultdict, deque
+from werkzeug.security import generate_password_hash, check_password_hash
 from config import get_config
 
 # Flask 애플리케이션 인스턴스 생성
@@ -15,6 +16,9 @@ app = Flask(__name__)
 # 환경별 설정 적용 (1-10단계)
 config_class = get_config()
 app.config.from_object(config_class)
+
+# 세션 보안을 위한 시크릿 키 설정
+app.secret_key = app.config.get('SECRET_KEY', 'cutlet-secret-key-change-in-production')
 
 # 데이터베이스 설정 (환경 변수 기반)
 DATABASE = app.config['DATABASE_PATH']
@@ -60,30 +64,68 @@ def get_db_connection():
 
 # 데이터베이스 테이블 생성 함수
 def create_tables():
-    """urls 테이블 및 성능 최적화 인덱스를 생성하는 함수 (1-9단계)"""
+    """users 및 urls 테이블 및 성능 최적화 인덱스를 생성하는 함수 (2-1단계)"""
     conn = get_db_connection()
     try:
-        # urls 테이블 생성
+        # users 테이블 생성 (2-1단계)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # urls 테이블 생성 (기존 + user_id 컬럼 추가)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS urls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 original_url TEXT NOT NULL,
                 short_code TEXT UNIQUE NOT NULL,
+                user_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                click_count INTEGER DEFAULT 0
+                click_count INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
             )
         ''')
         
-        # 성능 최적화를 위한 인덱스 추가 (1-9단계)
+        # 성능 최적화를 위한 인덱스 추가 (1-9단계 + 2-1단계)
         conn.execute('CREATE INDEX IF NOT EXISTS idx_short_code ON urls(short_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_original_url ON urls(original_url)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_click_count ON urls(click_count DESC)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON urls(created_at)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON urls(user_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_username ON users(username)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_email ON users(email)')
         
         conn.commit()
-        print("✅ urls 테이블 및 성능 인덱스가 성공적으로 생성되었습니다.")
+        print("✅ users 및 urls 테이블과 성능 인덱스가 성공적으로 생성되었습니다.")
     except Exception as e:
         print(f"❌ 테이블 생성 오류: {e}")
+    finally:
+        conn.close()
+
+# 데이터베이스 마이그레이션 함수 (2-1단계)
+def migrate_database():
+    """기존 데이터베이스를 새로운 스키마로 마이그레이션하는 함수"""
+    conn = get_db_connection()
+    try:
+        # urls 테이블에 user_id 컬럼이 있는지 확인
+        cursor = conn.execute("PRAGMA table_info(urls)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'user_id' not in columns:
+            print("🔄 urls 테이블에 user_id 컬럼을 추가하는 중...")
+            conn.execute('ALTER TABLE urls ADD COLUMN user_id INTEGER')
+            conn.commit()
+            print("✅ urls 테이블 마이그레이션이 완료되었습니다.")
+        else:
+            print("✅ urls 테이블이 이미 최신 스키마입니다.")
+            
+    except Exception as e:
+        print(f"❌ 마이그레이션 오류: {e}")
     finally:
         conn.close()
 
@@ -92,6 +134,7 @@ def init_database():
     """데이터베이스를 초기화하고 테이블을 생성하는 함수"""
     print("🔄 데이터베이스 초기화 중...")
     create_tables()
+    migrate_database()
     
     # 테스트 데이터가 없으면 추가
     conn = get_db_connection()
@@ -146,14 +189,14 @@ def get_all_urls():
         conn.close()
 
 # URL 추가 함수
-def add_url(original_url, short_code):
-    """새로운 URL을 데이터베이스에 추가하는 함수"""
+def add_url(original_url, short_code, user_id=None):
+    """새로운 URL을 데이터베이스에 추가하는 함수 (2-1단계: user_id 지원)"""
     conn = get_db_connection()
     try:
         conn.execute('''
-            INSERT INTO urls (original_url, short_code) 
-            VALUES (?, ?)
-        ''', (original_url, short_code))
+            INSERT INTO urls (original_url, short_code, user_id) 
+            VALUES (?, ?, ?)
+        ''', (original_url, short_code, user_id))
         conn.commit()
         return True
     except Exception as e:
@@ -584,8 +627,8 @@ def add_to_cache(short_code, original_url):
         
         URL_CACHE[short_code] = original_url
 
-def shorten_url_service(original_url):
-    """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선)"""
+def shorten_url_service(original_url, user_id=None):
+    """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선 + 2-1단계: user_id 지원)"""
     
     # URL 유효성 검사 (강화된 버전)
     is_valid, error_message = is_valid_url(original_url)
@@ -633,8 +676,8 @@ def shorten_url_service(original_url):
     try:
         short_code = generate_unique_short_code(6)  # 6글자 코드 생성
         
-        # 데이터베이스에 저장
-        success = add_url(original_url, short_code)
+        # 데이터베이스에 저장 (user_id 포함)
+        success = add_url(original_url, short_code, user_id)
         
         if success:
             # 단축 URL 생성
@@ -724,8 +767,9 @@ def shorten_url():
         # 로깅: 요청 기록 (1-9단계)
         logging.info(f"URL shortening request from {client_ip}: {original_url[:100]}...")
         
-        # URL 단축 서비스 호출
-        result = shorten_url_service(original_url)
+        # URL 단축 서비스 호출 (user_id 포함)
+        user_id = session.get('user_id') if session.get('logged_in') else None
+        result = shorten_url_service(original_url, user_id)
         
         if is_form_request:
             # 폼 요청의 경우 결과 페이지로 리다이렉트
@@ -757,6 +801,96 @@ def shorten_url():
             }), 500
         else:
             return redirect('/?error=서버 오류가 발생했습니다')
+
+# =====================================
+# 사용자 인증 라우트 (2-2단계, 2-3단계)
+# =====================================
+
+# 회원가입 페이지 (2-2단계)
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    """회원가입 페이지 (GET: 폼 표시, POST: 회원가입 처리)"""
+    
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        
+        print(f"🔍 회원가입 요청: username={username}, email={email}")
+        
+        # 입력 검증
+        if not username or not email or not password:
+            error_msg = "모든 필드를 입력해주세요."
+            print(f"❌ 검증 실패: {error_msg}")
+            return render_template_string(SIGNUP_HTML, error=error_msg)
+        
+        if len(username) < 3 or len(username) > 20:
+            error_msg = "사용자명은 3-20자 사이여야 합니다."
+            print(f"❌ 검증 실패: {error_msg}")
+            return render_template_string(SIGNUP_HTML, error=error_msg)
+        
+        if len(password) < 6:
+            error_msg = "비밀번호는 최소 6자 이상이어야 합니다."
+            print(f"❌ 검증 실패: {error_msg}")
+            return render_template_string(SIGNUP_HTML, error=error_msg)
+        
+        if password != confirm_password:
+            error_msg = "비밀번호가 일치하지 않습니다."
+            print(f"❌ 검증 실패: {error_msg}")
+            return render_template_string(SIGNUP_HTML, error=error_msg)
+        
+        print(f"✅ 검증 통과, 사용자 생성 시도...")
+        
+        # 사용자 생성
+        success, message = create_user(username, email, password)
+        
+        if success:
+            print(f"✅ 사용자 생성 성공: {username}")
+            return redirect('/login?message=회원가입이 완료되었습니다. 로그인해주세요.')
+        else:
+            print(f"❌ 사용자 생성 실패: {message}")
+            return render_template_string(SIGNUP_HTML, error=message)
+    
+    print("📝 회원가입 폼 표시 (GET 요청)")
+    return render_template_string(SIGNUP_HTML)
+
+# 로그인 페이지 (2-3단계)
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """로그인 페이지 (GET: 폼 표시, POST: 로그인 처리)"""
+    
+    if request.method == 'POST':
+        username_or_email = request.form.get('username_or_email', '').strip()
+        password = request.form.get('password', '')
+        
+        # 입력 검증
+        if not username_or_email or not password:
+            return render_template_string(LOGIN_HTML, error="사용자명/이메일과 비밀번호를 입력해주세요.")
+        
+        # 세션에 사용자 정보 저장
+        success, user = verify_user_credentials(username_or_email, password)
+        
+        if success:
+            session['logged_in'] = True
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['email'] = user['email']
+            
+            return redirect('/?message=로그인되었습니다.')
+        else:
+            return render_template_string(LOGIN_HTML, error="사용자명/이메일 또는 비밀번호가 올바르지 않습니다.")
+    
+    # GET 요청시 메시지 표시
+    message = request.args.get('message', '')
+    return render_template_string(LOGIN_HTML, message=message)
+
+# 로그아웃 (2-3단계)
+@app.route('/logout')
+def logout():
+    """로그아웃 처리"""
+    session.clear()
+    return redirect('/?message=로그아웃되었습니다.')
 
 # =====================================
 # 관리자 페이지 및 통계 기능 (1-7단계)
@@ -1579,7 +1713,7 @@ def delete_url_api(short_code):
 @app.route('/favicon.ico')
 def favicon():
     """Cutlet 브랜드 파비콘 응답"""
-    # 🥩 이모지를 SVG로 변환한 파비콘
+    #  이모지를 SVG로 변환한 파비콘
     favicon_svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
         <text x="50%" y="50%" style="dominant-baseline:central;text-anchor:middle;font-size:24px;">🥩</text>
     </svg>'''
@@ -1815,6 +1949,8 @@ def main_page():
     
     # 에러 메시지 확인
     error_message = request.args.get('error', '')
+    # 성공 메시지 확인
+    success_message = request.args.get('message', '')
     
     # 에러 알림 HTML
     error_html = ''
@@ -1825,6 +1961,19 @@ def main_page():
                 <span class="error-icon">⚠️</span>
                 <span class="error-text">{error_message}</span>
                 <button class="error-close" onclick="closeError()">&times;</button>
+            </div>
+        </div>
+        '''
+    
+    # 성공 알림 HTML
+    success_html = ''
+    if success_message:
+        success_html = f'''
+        <div class="success-alert" id="successAlert">
+            <div class="success-content">
+                <span class="success-icon">✅</span>
+                <span class="success-text">{success_message}</span>
+                <button class="success-close" onclick="closeSuccess()">&times;</button>
             </div>
         </div>
         '''
@@ -2142,6 +2291,71 @@ def main_page():
                     transform: translateX(-50%) translateY(-20px);
                 }
             }
+            
+            .user-info {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-weight: 600;
+                font-size: 0.9rem;
+                margin: 0 10px;
+            }
+            
+            .success-alert {
+                position: fixed;
+                top: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                background: #d4edda;
+                border: 2px solid #c3e6cb;
+                border-radius: 10px;
+                padding: 0;
+                max-width: 500px;
+                width: 90%;
+                box-shadow: 0 4px 15px rgba(40, 167, 69, 0.3);
+                z-index: 1000;
+                animation: slideDown 0.3s ease-out;
+            }
+            
+            .success-content {
+                display: flex;
+                align-items: center;
+                padding: 15px 20px;
+            }
+            
+            .success-icon {
+                font-size: 1.2rem;
+                margin-right: 10px;
+                color: #28a745;
+            }
+            
+            .success-text {
+                flex: 1;
+                color: #155724;
+                font-weight: 500;
+            }
+            
+            .success-close {
+                background: none;
+                border: none;
+                font-size: 1.5rem;
+                color: #28a745;
+                cursor: pointer;
+                padding: 0;
+                margin-left: 10px;
+                width: 24px;
+                height: 24px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 50%;
+                transition: background-color 0.3s ease;
+            }
+            
+            .success-close:hover {
+                background-color: rgba(40, 167, 69, 0.1);
+            }
         </style>
     </head>
     <body>
@@ -2198,6 +2412,13 @@ def main_page():
                 <a href="/test" class="link">🧪 테스트 페이지</a>
                 <a href="/admin" class="link">🛠️ 관리자 페이지</a>
                 <a href="#" class="link" onclick="showApiDocs()">📖 API 문서</a>
+                ''' + ('''
+                <a href="/login" class="link">🔐 로그인</a>
+                <a href="/signup" class="link">📝 회원가입</a>
+                ''' if not session.get('logged_in') else f'''
+                <span class="user-info">👤 {session.get('username', '사용자')}</span>
+                <a href="/logout" class="link">🚪 로그아웃</a>
+                ''') + '''
             </div>
         </div>
         
@@ -2229,6 +2450,17 @@ def main_page():
                     errorAlert.style.animation = 'slideUp 0.3s ease-in';
                     setTimeout(function() {
                         errorAlert.remove();
+                    }, 300);
+                }
+            }
+            
+            // 성공 알림 닫기
+            function closeSuccess() {
+                const successAlert = document.getElementById('successAlert');
+                if (successAlert) {
+                    successAlert.style.animation = 'slideUp 0.3s ease-in';
+                    setTimeout(function() {
+                        successAlert.remove();
                     }, 300);
                 }
             }
@@ -2327,6 +2559,14 @@ def main_page():
                 }
             }, 7000);
             
+            // 성공 알림 자동 닫기 (7초 후)
+            setTimeout(function() {
+                const successAlert = document.getElementById('successAlert');
+                if (successAlert) {
+                    closeSuccess();
+                }
+            }, 7000);
+            
             // 키보드 단축키 (Ctrl+Enter로 폼 제출)
             document.addEventListener('keydown', function(e) {
                 if (e.ctrlKey && e.key === 'Enter') {
@@ -2341,9 +2581,15 @@ def main_page():
     </html>
     '''
     
-    # error_html을 body 시작 부분에 삽입
-    if error_html:
-        html_content = html_content.replace('<body>', f'<body>\n        {error_html}')
+    # error_html과 success_html을 body 시작 부분에 삽입
+    if error_html or success_html:
+        body_start = '<body>'
+        body_content = body_start + '\n        '
+        if error_html:
+            body_content += error_html + '\n        '
+        if success_html:
+            body_content += success_html + '\n        '
+        html_content = html_content.replace(body_start, body_content)
     
     return html_content
 
@@ -3040,6 +3286,508 @@ curl -X POST http://localhost:8080/shorten \\<br>
     </body>
     </html>
     '''
+
+# =====================================
+# 사용자 관리 함수들 (2-1단계)
+# =====================================
+
+def create_user(username, email, password):
+    """새로운 사용자를 생성하는 함수"""
+    conn = get_db_connection()
+    try:
+        password_hash = generate_password_hash(password)
+        conn.execute('''
+            INSERT INTO users (username, email, password_hash) 
+            VALUES (?, ?, ?)
+        ''', (username, email, password_hash))
+        conn.commit()
+        return True, "사용자가 성공적으로 생성되었습니다."
+    except sqlite3.IntegrityError:
+        return False, "사용자명 또는 이메일이 이미 존재합니다."
+    except Exception as e:
+        return False, f"사용자 생성 중 오류가 발생했습니다: {str(e)}"
+    finally:
+        conn.close()
+
+def get_user_by_username(username):
+    """사용자명으로 사용자 정보를 조회하는 함수"""
+    conn = get_db_connection()
+    try:
+        user = conn.execute('''
+            SELECT id, username, email, password_hash, created_at 
+            FROM users 
+            WHERE username = ? 
+            LIMIT 1
+        ''', (username,)).fetchone()
+        return user
+    except Exception as e:
+        print(f"❌ 사용자 조회 오류: {e}")
+        return None
+    finally:
+        conn.close()
+
+def get_user_by_email(email):
+    """이메일로 사용자 정보를 조회하는 함수"""
+    conn = get_db_connection()
+    try:
+        user = conn.execute('''
+            SELECT id, username, email, password_hash, created_at 
+            FROM users 
+            WHERE email = ? 
+            LIMIT 1
+        ''', (email,)).fetchone()
+        return user
+    except Exception as e:
+        print(f"❌ 사용자 조회 오류: {e}")
+        return None
+    finally:
+        conn.close()
+
+def verify_user_credentials(username_or_email, password):
+    """사용자 인증 정보를 검증하는 함수"""
+    # 사용자명 또는 이메일로 사용자 찾기
+    user = get_user_by_username(username_or_email)
+    if not user:
+        user = get_user_by_email(username_or_email)
+    
+    if user and check_password_hash(user['password_hash'], password):
+        return True, user
+    else:
+        return False, None
+
+def get_user_urls(user_id):
+    """특정 사용자의 URL 목록을 조회하는 함수"""
+    conn = get_db_connection()
+    try:
+        urls = conn.execute('''
+            SELECT id, original_url, short_code, created_at, click_count 
+            FROM urls 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+        ''', (user_id,)).fetchall()
+        return urls
+    except Exception as e:
+        print(f"❌ 사용자 URL 조회 오류: {e}")
+        return []
+    finally:
+        conn.close()
+
+# =====================================
+# URL 데이터 조회 함수
+# =====================================
+
+# =====================================
+# HTML 템플릿 (2-2단계, 2-3단계)
+# =====================================
+
+# 회원가입 페이지 HTML
+SIGNUP_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>회원가입 - Cutlet</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .logo {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #D2691E;
+            margin-bottom: 10px;
+        }
+        
+        .brand-emoji {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 30px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        .form-label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 1rem;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 15px 20px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        
+        .form-input:focus {
+            border-color: #D2691E;
+            box-shadow: 0 0 0 3px rgba(210, 105, 30, 0.1);
+        }
+        
+        .submit-btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(210, 105, 30, 0.3);
+        }
+        
+        .error-message {
+            background: #fee;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+            text-align: left;
+        }
+        
+        .links {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+        
+        .link {
+            display: inline-block;
+            margin: 0 10px;
+            color: #D2691E;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s ease;
+        }
+        
+        .link:hover {
+            color: #CD853F;
+            text-decoration: underline;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 30px 20px;
+                margin: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="brand-emoji">🥩</div>
+        <div class="logo">Cutlet</div>
+        <div class="subtitle">회원가입</div>
+        
+        ''' + (f'<div class="error-message">⚠️ {error}</div>' if 'error' in locals() else '') + '''
+        
+        <form method="POST" action="/signup">
+            <div class="form-group">
+                <label for="username" class="form-label">사용자명</label>
+                <input 
+                    type="text" 
+                    id="username" 
+                    name="username" 
+                    class="form-input"
+                    placeholder="3-20자 사이의 사용자명"
+                    required
+                    minlength="3"
+                    maxlength="20"
+                >
+            </div>
+            
+            <div class="form-group">
+                <label for="email" class="form-label">이메일</label>
+                <input 
+                    type="email" 
+                    id="email" 
+                    name="email" 
+                    class="form-input"
+                    placeholder="example@email.com"
+                    required
+                >
+            </div>
+            
+            <div class="form-group">
+                <label for="password" class="form-label">비밀번호</label>
+                <input 
+                    type="password" 
+                    id="password" 
+                    name="password" 
+                    class="form-input"
+                    placeholder="최소 6자 이상"
+                    required
+                    minlength="6"
+                >
+            </div>
+            
+            <div class="form-group">
+                <label for="confirm_password" class="form-label">비밀번호 확인</label>
+                <input 
+                    type="password" 
+                    id="confirm_password" 
+                    name="confirm_password" 
+                    class="form-input"
+                    placeholder="비밀번호를 다시 입력하세요"
+                    required
+                    minlength="6"
+                >
+            </div>
+            
+            <button type="submit" class="submit-btn">
+                📝 회원가입
+            </button>
+        </form>
+        
+        <div class="links">
+            <a href="/" class="link">🏠 메인 페이지</a>
+            <a href="/login" class="link">🔐 로그인</a>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+# 로그인 페이지 HTML
+LOGIN_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>로그인 - Cutlet</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .logo {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #D2691E;
+            margin-bottom: 10px;
+        }
+        
+        .brand-emoji {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 30px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        .form-label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 1rem;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 15px 20px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        
+        .form-input:focus {
+            border-color: #D2691E;
+            box-shadow: 0 0 0 3px rgba(210, 105, 30, 0.1);
+        }
+        
+        .submit-btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(210, 105, 30, 0.3);
+        }
+        
+        .error-message {
+            background: #fee;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+            text-align: left;
+        }
+        
+        .success-message {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #c3e6cb;
+            text-align: left;
+        }
+        
+        .links {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+        
+        .link {
+            display: inline-block;
+            margin: 0 10px;
+            color: #D2691E;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s ease;
+        }
+        
+        .link:hover {
+            color: #CD853F;
+            text-decoration: underline;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 30px 20px;
+                margin: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="brand-emoji">🥩</div>
+        <div class="logo">Cutlet</div>
+        <div class="subtitle">로그인</div>
+        
+        ''' + (f'<div class="error-message">⚠️ {error}</div>' if 'error' in locals() else '') + '''
+        ''' + (f'<div class="success-message">✅ {message}</div>' if 'message' in locals() else '') + '''
+        
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="username_or_email" class="form-label">사용자명 또는 이메일</label>
+                <input 
+                    type="text" 
+                    id="username_or_email" 
+                    name="username_or_email" 
+                    class="form-input"
+                    placeholder="사용자명 또는 이메일을 입력하세요"
+                    required
+                >
+            </div>
+            
+            <div class="form-group">
+                <label for="password" class="form-label">비밀번호</label>
+                <input 
+                    type="password" 
+                    id="password" 
+                    name="password" 
+                    class="form-input"
+                    placeholder="비밀번호를 입력하세요"
+                    required
+                >
+            </div>
+            
+            <button type="submit" class="submit-btn">
+                🔐 로그인
+            </button>
+        </form>
+        
+        <div class="links">
+            <a href="/" class="link">🏠 메인 페이지</a>
+            <a href="/signup" class="link">📝 회원가입</a>
+        </div>
+    </div>
+</body>
+</html>
+'''
 
 if __name__ == '__main__':
     # 앱 시작 시 데이터베이스 초기화
