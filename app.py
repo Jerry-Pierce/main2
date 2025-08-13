@@ -98,6 +98,22 @@ def create_tables():
             )
         ''')
         
+        # 클릭 이벤트 상세 로그 테이블 (3-2단계)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS click_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_id INTEGER,
+                short_code TEXT NOT NULL,
+                ip TEXT,
+                user_agent TEXT,
+                referrer TEXT,
+                device TEXT,
+                browser TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (url_id) REFERENCES urls (id) ON DELETE CASCADE
+            )
+        ''')
+        
         # 성능 최적화를 위한 인덱스 추가 (1-9단계 + 2-1단계)
         conn.execute('CREATE INDEX IF NOT EXISTS idx_short_code ON urls(short_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_original_url ON urls(original_url)')
@@ -106,6 +122,8 @@ def create_tables():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON urls(user_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_username ON users(username)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_email ON users(email)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_click_short_code ON click_events(short_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_click_created_at ON click_events(created_at)')
         
         conn.commit()
         print("✅ users 및 urls 테이블과 성능 인덱스가 성공적으로 생성되었습니다.")
@@ -307,6 +325,30 @@ def update_click_count(short_code):
     except Exception as e:
         print(f"❌ 클릭 수 업데이트 오류: {e}")
         return False
+    finally:
+        conn.close()
+
+def log_click_event(short_code, request):
+    """클릭 이벤트 상세 정보를 click_events 테이블에 저장 (3-2단계)"""
+    conn = get_db_connection()
+    try:
+        # 해당 URL의 id 조회
+        url_row = conn.execute('SELECT id FROM urls WHERE short_code = ? LIMIT 1', (short_code,)).fetchone()
+        url_id = url_row['id'] if url_row else None
+        ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
+        if ip:
+            ip = ip.split(',')[0].strip()
+        ua = request.headers.get('User-Agent', '')
+        ref = request.headers.get('Referer', '')
+        device = 'Mobile' if any(k in ua.lower() for k in ['iphone','android','mobile']) else 'Desktop'
+        browser = 'Chrome' if 'chrome' in ua.lower() else ('Firefox' if 'firefox' in ua.lower() else ('Safari' if 'safari' in ua.lower() else 'Other'))
+        conn.execute('''
+            INSERT INTO click_events (url_id, short_code, ip, user_agent, referrer, device, browser)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (url_id, short_code, ip, ua, ref, device, browser))
+        conn.commit()
+    except Exception as e:
+        print(f"❌ 클릭 이벤트 기록 오류: {e}")
     finally:
         conn.close()
 
@@ -1020,6 +1062,7 @@ def dashboard():
                 <div class="url-actions">
                     <a href="/{url['short_code']}" target="_blank" class="btn btn-primary">🔗 테스트</a>
                     <a href="/stats/{url['short_code']}" class="btn btn-info">📈 통계</a>
+                <a href="/analytics/{url['short_code']}" class="btn btn-info">🔬 상세 분석</a>
                     <button onclick="deleteUrl({url['id']}, '{url['short_code']}')" class="btn btn-danger">🗑️ 삭제</button>
                 </div>
             </div>
@@ -1777,6 +1820,115 @@ def upgrade_prepare():
     </html>
     '''
 
+# =====================================
+# 3-2단계: 프리미엄 전용 상세 분석 페이지
+# =====================================
+
+def premium_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return redirect('/login?message=로그인이 필요합니다.')
+        if user['user_type'] not in ('premium', 'admin'):
+            return redirect('/pricing?message=프리미엄 전용 기능입니다. 업그레이드 해주세요.')
+        return f(*args, **kwargs)
+    return wrapper
+
+def get_click_aggregations(short_code):
+    conn = get_db_connection()
+    try:
+        daily = conn.execute('''
+            SELECT strftime('%Y-%m-%d', created_at) as d, COUNT(*) c
+            FROM click_events WHERE short_code = ?
+            GROUP BY d ORDER BY d DESC LIMIT 30
+        ''', (short_code,)).fetchall()
+        hourly = conn.execute('''
+            SELECT strftime('%H', created_at) as h, COUNT(*) c
+            FROM click_events WHERE short_code = ?
+            GROUP BY h ORDER BY h
+        ''', (short_code,)).fetchall()
+        geo = conn.execute('''
+            SELECT COALESCE(ip, 'unknown') as g, COUNT(*) c
+            FROM click_events WHERE short_code = ?
+            GROUP BY g ORDER BY c DESC LIMIT 10
+        ''', (short_code,)).fetchall()
+        device = conn.execute('''
+            SELECT COALESCE(device,'Other') d, COUNT(*) c
+            FROM click_events WHERE short_code = ?
+            GROUP BY d ORDER BY c DESC
+        ''', (short_code,)).fetchall()
+        browser = conn.execute('''
+            SELECT COALESCE(browser,'Other') b, COUNT(*) c
+            FROM click_events WHERE short_code = ?
+            GROUP BY b ORDER BY c DESC
+        ''', (short_code,)).fetchall()
+        ref = conn.execute('''
+            SELECT COALESCE(referrer,'Direct') r, COUNT(*) c
+            FROM click_events WHERE short_code = ?
+            GROUP BY r ORDER BY c DESC LIMIT 10
+        ''', (short_code,)).fetchall()
+        return daily, hourly, geo, device, browser, ref
+    finally:
+        conn.close()
+
+@app.route('/analytics/<short_code>')
+@login_required
+@premium_required
+def analytics_page(short_code):
+    url = get_url_by_short_code(short_code)
+    if not url:
+        return redirect('/404')
+    daily, hourly, geo, device, browser, ref = get_click_aggregations(short_code)
+    # 간단 차트: CSS 막대그래프(의존성 최소화)
+    def bars(rows, max_width=300):
+        total = max([r[1] for r in rows] + [1])
+        items = []
+        for label, count in rows:
+            width = int(max_width * (count/total))
+            items.append(f'<div style="display:flex;align-items:center;gap:10px;margin:6px 0;"><div style="width:120px;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{label}</div><div style="background:#D2691E;height:12px;border-radius:8px;width:{width}px;"></div><div style="color:#333;min-width:30px;text-align:right;">{count}</div></div>')
+        return ''.join(items)
+
+    daily_html = bars([(row['d'], row['c']) for row in daily])
+    hourly_html = bars([(row['h'] + '시', row['c']) for row in hourly])
+    geo_html = bars([(row['g'], row['c']) for row in geo])
+    device_html = bars([(row['d'], row['c']) for row in device])
+    browser_html = bars([(row['b'], row['c']) for row in browser])
+    ref_html = bars([(row['r'], row['c']) for row in ref])
+
+    return f'''
+    <!DOCTYPE html>
+    <html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>상세 분석 - {short_code}</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#f8f9fa; padding:24px; }}
+        .wrap {{ max-width:1000px; margin:0 auto; }}
+        .card {{ background:#fff; border:1px solid #eee; border-radius:16px; box-shadow:0 10px 24px rgba(0,0,0,.06); padding: 20px; margin-bottom:18px; }}
+        h1 {{ color:#D2691E; margin-bottom:10px; }}
+        h2 {{ font-size:1.2rem; margin: 6px 0 12px; color:#333; }}
+        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap:18px; }}
+        a.btn {{ display:inline-block; padding:10px 16px; border-radius:10px; text-decoration:none; font-weight:600; background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff; }}
+        .meta {{ color:#666; margin-bottom:8px; }}
+    </style></head>
+    <body>
+        <div class="wrap">
+            <h1>🔬 상세 분석</h1>
+            <div class="meta">단축 코드: <b>{short_code}</b> • 원본 URL: <a href="{url['original_url']}" target="_blank">{url['original_url']}</a></div>
+            <div class="grid">
+                <div class="card"><h2>📅 일별 클릭</h2>{daily_html or '<div>데이터 없음</div>'}</div>
+                <div class="card"><h2>⏰ 시간대별 클릭</h2>{hourly_html or '<div>데이터 없음</div>'}</div>
+                <div class="card"><h2>🌍 IP/지역(간이)</h2>{geo_html or '<div>데이터 없음</div>'}</div>
+                <div class="card"><h2>🖥️ 디바이스</h2>{device_html or '<div>데이터 없음</div>'}</div>
+                <div class="card"><h2>🧭 브라우저</h2>{browser_html or '<div>데이터 없음</div>'}</div>
+                <div class="card"><h2>🔗 레퍼러</h2>{ref_html or '<div>데이터 없음</div>'}</div>
+            </div>
+            <div style="text-align:center;margin-top:12px;">
+                <a class="btn" href="/dashboard">📊 대시보드로 돌아가기</a>
+            </div>
+        </div>
+    </body></html>
+    '''
+
 # 개별 URL 상세 통계 페이지
 @app.route('/stats/<short_code>')
 def stats_page(short_code):
@@ -2241,8 +2393,12 @@ def redirect_to_original(short_code):
         original_url = url_data['original_url']
         add_to_cache(short_code, original_url)
         
-        # 클릭 수 업데이트
+        # 클릭 수 업데이트 및 상세 클릭 이벤트 기록 (3-2단계)
         update_success = update_click_count(short_code)
+        try:
+            log_click_event(short_code, request)
+        except Exception as _:
+            pass
         if update_success:
             print(f"✅ 클릭 수 업데이트 성공: {short_code} -> 클릭 수: {url_data['click_count'] + 1}")
         else:
@@ -3002,7 +3158,6 @@ def main_page():
                 <span class="user-info">👤 환영합니다, {session.get('username', '사용자')}님!</span>
                 <a href="/dashboard" class="link">📊 대시보드</a>
                 <a href="/profile" class="link">⚙️ 프로필</a>
-                <a href="/pricing" class="link">💳 요금제</a>
                 <a href="/logout" class="link">🚪 로그아웃</a>
                 ''') + '''
             </div>
