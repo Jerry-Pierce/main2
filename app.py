@@ -125,6 +125,31 @@ def create_tables():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_email ON users(email)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_click_short_code ON click_events(short_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_click_created_at ON click_events(created_at)')
+
+        # 결제/구독 기반 테이블 (3-4단계)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                status TEXT NOT NULL, -- success / failed / pending
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                plan TEXT NOT NULL, -- free / premium
+                status TEXT NOT NULL, -- active / canceled / past_due
+                current_period_end TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
         
         conn.commit()
         print("✅ users 및 urls 테이블과 성능 인덱스가 성공적으로 생성되었습니다.")
@@ -1962,6 +1987,106 @@ def analytics_page(short_code):
             <div style="text-align:center;margin-top:12px;">
                 <a class="btn" href="/dashboard">📊 대시보드로 돌아가기</a>
             </div>
+        </div>
+    </body></html>
+    '''
+
+# =====================================
+# 3-4단계: 결제 시스템 기반 구축 (UI 및 시뮬레이션)
+# =====================================
+
+def ensure_subscription_row(user_id):
+    conn = get_db_connection()
+    try:
+        row = conn.execute('SELECT user_id FROM subscriptions WHERE user_id = ?', (user_id,)).fetchone()
+        if not row:
+            conn.execute('INSERT INTO subscriptions (user_id, plan, status, current_period_end) VALUES (?, "free", "active", NULL)', (user_id,))
+            conn.commit()
+    finally:
+        conn.close()
+
+@app.route('/checkout')
+@login_required
+def checkout_page():
+    user = get_current_user()
+    ensure_subscription_row(user['id'])
+    return f'''
+    <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>체크아웃 - Cutlet</title>
+    <style>body {{font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;background:#f8f9fa;padding:24px;}} .wrap {{max-width:760px;margin:0 auto;background:#fff;border:1px solid #eee;border-radius:16px;box-shadow:0 10px 24px rgba(0,0,0,.06);padding:24px;}} .title {{font-size:1.8rem;margin-bottom:10px;color:#333}} .plan {{background:#fff8f0;border:1px solid #ffe0c2;color:#8a5a00;border-radius:10px;padding:12px 14px;margin-bottom:16px}} .btn {{display:inline-block;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:600;margin-right:10px}} .primary {{background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%);color:#fff}} .secondary {{background:#f8f9fa;color:#D2691E;border:2px solid #D2691E}}</style>
+    </head><body>
+        <div class="wrap">
+            <div class="title">체크아웃</div>
+            <div class="plan">프리미엄 요금제: <b>$4.99 / 월</b> • 무제한 URL, 상세 분석, 커스텀 URL</div>
+            <p style="color:#666">지금은 결제 연동 준비 단계입니다. 아래 테스트 결제 버튼을 사용하면 프리미엄이 즉시 활성화됩니다.</p>
+            <div style="margin-top:12px;">
+                <a class="btn secondary" href="/pricing">요금제 보기</a>
+                <a class="btn primary" href="/payment/test-charge">테스트 결제(프리미엄 활성화)</a>
+            </div>
+        </div>
+    </body></html>
+    '''
+
+@app.route('/payment/test-charge')
+@login_required
+def payment_test_charge():
+    user = get_current_user()
+    # 결제 시뮬레이션: 결제 성공 처리 및 프리미엄 전환
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO payments (user_id, amount_cents, status, description) VALUES (?, ?, ?, ?)', (user['id'], 499, 'success', 'Test premium activation'))
+        # 구독 갱신: 다음 결제일 +30일(간이)
+        next_date = (datetime.datetime.utcnow() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        ensure_subscription_row(user['id'])
+        conn.execute('UPDATE subscriptions SET plan = "premium", status = "active", current_period_end = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?', (next_date, user['id']))
+        conn.execute('UPDATE users SET user_type = "premium" WHERE id = ?', (user['id'],))
+        conn.commit()
+    finally:
+        conn.close()
+    return redirect('/payment/success')
+
+@app.route('/payment/success')
+@login_required
+def payment_success():
+    return '''
+    <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>결제 성공</title>
+    <style>body {font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#f8fff8; padding:24px;} .wrap {max-width:720px; margin:0 auto; background:#fff; border:1px solid #e6ffec; border-radius:16px; box-shadow:0 10px 24px rgba(0,0,0,.06); padding:24px;} .title {color:#228B22; font-size:1.6rem; margin-bottom:10px;} a.btn {display:inline-block; padding:10px 16px; border-radius:10px; text-decoration:none; font-weight:600; background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff;}</style></head>
+    <body><div class="wrap"><div class="title">결제가 성공적으로 처리되었습니다</div><p>프리미엄이 활성화되었습니다. 무제한 URL, 상세 분석, 커스텀 URL을 이용하실 수 있습니다.</p><a href="/dashboard" class="btn">대시보드로 이동</a></div></body></html>
+    '''
+
+@app.route('/payment/cancel')
+@login_required
+def payment_cancel():
+    return '''
+    <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>결제 취소</title>
+    <style>body {font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#fff8f8; padding:24px;} .wrap {max-width:720px; margin:0 auto; background:#fff; border:1px solid #ffe0e0; border-radius:16px; box-shadow:0 10px 24px rgba(0,0,0,.06); padding:24px;} .title {color:#c53030; font-size:1.6rem; margin-bottom:10px;} a.btn {display:inline-block; padding:10px 16px; border-radius:10px; text-decoration:none; font-weight:600; background:#f8f9fa; color:#D2691E; border:2px solid #D2691E;}</style></head>
+    <body><div class="wrap"><div class="title">결제가 취소되었습니다</div><p>필요하실 때 언제든 다시 진행하실 수 있습니다.</p><a href="/pricing" class="btn">요금제 보기</a></div></body></html>
+    '''
+
+@app.route('/subscription')
+@login_required
+def subscription_page():
+    user = get_current_user()
+    conn = get_db_connection()
+    try:
+        sub = conn.execute('SELECT plan, status, current_period_end FROM subscriptions WHERE user_id = ? LIMIT 1', (user['id'],)).fetchone()
+        last_payment = conn.execute('SELECT status, amount_cents, datetime(created_at) as t FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', (user['id'],)).fetchone()
+    finally:
+        conn.close()
+    plan = (sub['plan'] if sub else 'free')
+    status = (sub['status'] if sub else 'inactive')
+    next_date = (sub['current_period_end'] if sub and sub['current_period_end'] else '—')
+    last_txt = (f"최근 결제: {(last_payment['amount_cents']/100):.2f} USD, {last_payment['status']} ({last_payment['t']})" if last_payment else '최근 결제 없음')
+    return f'''
+    <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>구독 관리</title>
+    <style>body {{font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#f8f9fa; padding:24px;}} .wrap {{max-width:820px; margin:0 auto;}} .card {{background:#fff; border:1px solid #eee; border-radius:16px; box-shadow:0 10px 24px rgba(0,0,0,.06); padding:20px; margin-bottom:16px;}} .btn {{display:inline-block; padding:10px 16px; border-radius:10px; text-decoration:none; font-weight:600;}} .primary {{background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff;}} .secondary {{background:#f8f9fa; color:#D2691E; border:2px solid #D2691E;}}</style></head>
+    <body>
+        <div class="wrap">
+            <div class="card"><h2>현재 플랜</h2><p>플랜: <b>{plan}</b> • 상태: <b>{status}</b></p><p>다음 결제일: {next_date}</p></div>
+            <div class="card"><h2>결제/구독 작업</h2>
+                <a href="/checkout" class="btn primary">결제하기</a>
+                <a href="/pricing" class="btn secondary">요금제 보기</a>
+            </div>
+            <div class="card"><h2>최근 결제 내역</h2><p>{last_txt}</p></div>
         </div>
     </body></html>
     '''
