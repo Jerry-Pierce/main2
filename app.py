@@ -1633,6 +1633,150 @@ def admin_page():
         <a href="/">메인 페이지로 돌아가기</a>
         '''
 
+# =====================================
+# 3-1단계: 가격 정책/업그레이드 안내
+# =====================================
+
+@app.route('/pricing')
+def pricing_page():
+    """요금제 소개 페이지 (UI만)"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>요금제 - Cutlet</title>
+        <style>
+            * { box-sizing: border-box; margin:0; padding:0; }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); min-height:100vh; padding: 30px; }
+            .container { max-width: 1100px; margin: 0 auto; background:#fff; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); overflow:hidden; }
+            .header { background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); color:#fff; padding: 30px; text-align: center; }
+            .header h1 { font-size: 2.2rem; margin-bottom: 8px; }
+            .header p { opacity: .9; }
+            .content { padding: 30px; }
+            .plans { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:20px; margin-top: 10px; }
+            .card { border:1px solid #eee; border-radius: 16px; padding: 24px; box-shadow: 0 10px 24px rgba(0,0,0,.06); }
+            .card h2 { font-size: 1.5rem; margin-bottom: 8px; }
+            .price { font-size: 2rem; font-weight:700; color:#D2691E; margin: 12px 0 16px; }
+            ul { list-style: none; }
+            li { margin: 8px 0; color:#555; }
+            .check { color:#228B22; margin-right:6px; }
+            .x { color:#dc3545; margin-right:6px; }
+            .btn { display:inline-block; margin-top:14px; padding: 12px 20px; border-radius:10px; text-decoration:none; font-weight:600; }
+            .btn-primary { background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); color:#fff; }
+            .btn-secondary { background:#f8f9fa; color:#D2691E; border:2px solid #D2691E; }
+            .compare { margin-top: 30px; overflow-x:auto; }
+            table { width:100%; border-collapse: collapse; }
+            th, td { border:1px solid #eee; padding: 14px; text-align:center; }
+            th { background:#fafafa; }
+            .footer { padding: 20px 30px; text-align:center; border-top:1px solid #eee; }
+            .links a { color:#D2691E; text-decoration:none; margin:0 10px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>요금제</h1>
+                <p>필요에 맞게 선택하세요. 무료로 시작하고, 성장하면 프리미엄으로 업그레이드하세요.</p>
+            </div>
+            <div class="content">
+                <div class="plans">
+                    <div class="card">
+                        <h2>무료</h2>
+                        <div class="price">$0 / 월</div>
+                        <ul>
+                            <li><span class="check">✓</span> 월 10개 URL</li>
+                            <li><span class="check">✓</span> 기본 통계</li>
+                            <li><span class="x">✗</span> 상세 분석</li>
+                            <li><span class="x">✗</span> 커스텀 URL</li>
+                            <li><span class="x">✗</span> 우선 지원</li>
+                        </ul>
+                        <a href="/signup" class="btn btn-secondary">무료로 시작</a>
+                    </div>
+                    <div class="card">
+                        <h2>프리미엄</h2>
+                        <div class="price">$4.99 / 월</div>
+                        <ul>
+                            <li><span class="check">✓</span> 무제한 URL</li>
+                            <li><span class="check">✓</span> 상세 분석</li>
+                            <li><span class="check">✓</span> 커스텀 URL</li>
+                            <li><span class="check">✓</span> 우선 지원</li>
+                        </ul>
+                        <a href="/upgrade" class="btn btn-primary">프리미엄 업그레이드</a>
+                    </div>
+                </div>
+
+                <div class="compare">
+                    <h2 style="text-align:center; margin: 30px 0 15px;">무료 vs 프리미엄 비교</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>기능</th>
+                                <th>무료</th>
+                                <th>프리미엄</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>월 단축 가능량</td><td>10</td><td>무제한</td></tr>
+                            <tr><td>기본 통계</td><td>제공</td><td>제공</td></tr>
+                            <tr><td>상세 분석</td><td>미제공</td><td>제공</td></tr>
+                            <tr><td>커스텀 URL</td><td>미제공</td><td>제공</td></tr>
+                            <tr><td>우선 고객 지원</td><td>미제공</td><td>제공</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="footer">
+                <div class="links">
+                    <a href="/">메인</a>
+                    <a href="/dashboard">대시보드</a>
+                    <a href="/profile">프로필</a>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+@app.route('/upgrade')
+@login_required
+def upgrade_prepare():
+    """업그레이드 안내(결제 준비) 페이지 - UI만, 실제 결제 없음"""
+    current_user = get_current_user()
+    username = current_user['username'] if current_user else '사용자'
+    return f'''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>업그레이드 준비 - Cutlet</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f8f9fa; padding: 30px; }}
+            .wrap {{ max-width: 720px; margin: 0 auto; background:#fff; border-radius: 16px; border:1px solid #eee; box-shadow: 0 10px 24px rgba(0,0,0,.06); padding: 30px; }}
+            .title {{ font-size: 1.8rem; margin-bottom: 10px; color:#333; }}
+            .desc {{ color:#666; margin-bottom: 20px; }}
+            .note {{ background:#fff8f0; border:1px solid #ffe0c2; color:#8a5a00; padding:12px 14px; border-radius:10px; margin-bottom:16px; }}
+            .actions a {{ display:inline-block; margin-right:10px; padding: 12px 20px; border-radius:10px; text-decoration:none; font-weight:600; }}
+            .primary {{ background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); color:#fff; }}
+            .secondary {{ background:#f8f9fa; color:#D2691E; border:2px solid #D2691E; }}
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="title">프리미엄 업그레이드 준비</div>
+            <div class="desc">{username}님, 프리미엄은 무제한 URL, 상세 분석, 커스텀 URL을 제공합니다. 월 구독료는 $4.99 입니다.</div>
+            <div class="note">지금은 결제 연동 준비 단계입니다. 실제 결제는 아직 제공되지 않으며, 이후 결제 수단 연결(Stripe 등) 후 진행됩니다.</div>
+            <div class="actions">
+                <a href="/pricing" class="secondary">요금제 보기</a>
+                <a href="/dashboard" class="primary">대시보드로 돌아가기</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
 # 개별 URL 상세 통계 페이지
 @app.route('/stats/<short_code>')
 def stats_page(short_code):
@@ -2850,6 +2994,7 @@ def main_page():
                 <a href="/test" class="link">🧪 테스트 페이지</a>
                 <a href="/admin" class="link">🛠️ 관리자 페이지</a>
                 <a href="#" class="link" onclick="showApiDocs()">📖 API 문서</a>
+                <a href="/pricing" class="link">💳 요금제</a>
                 ''' + ('''
                 <a href="/login" class="link">🔐 로그인</a>
                 <a href="/signup" class="link">📝 회원가입</a>
@@ -2857,6 +3002,7 @@ def main_page():
                 <span class="user-info">👤 환영합니다, {session.get('username', '사용자')}님!</span>
                 <a href="/dashboard" class="link">📊 대시보드</a>
                 <a href="/profile" class="link">⚙️ 프로필</a>
+                <a href="/pricing" class="link">💳 요금제</a>
                 <a href="/logout" class="link">🚪 로그아웃</a>
                 ''') + '''
             </div>
