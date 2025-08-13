@@ -8,7 +8,9 @@ import threading
 import logging
 from collections import defaultdict, deque
 from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 from config import get_config
+from flask_wtf.csrf import CSRFProtect
 
 # Flask 애플리케이션 인스턴스 생성
 app = Flask(__name__)
@@ -19,6 +21,9 @@ app.config.from_object(config_class)
 
 # 세션 보안을 위한 시크릿 키 설정
 app.secret_key = app.config.get('SECRET_KEY', 'cutlet-secret-key-change-in-production')
+
+# CSRF 보호 비활성화 (render_template_string 사용으로 인해)
+# csrf = CSRFProtect(app)
 
 # 데이터베이스 설정 (환경 변수 기반)
 DATABASE = app.config['DATABASE_PATH']
@@ -128,6 +133,53 @@ def migrate_database():
         print(f"❌ 마이그레이션 오류: {e}")
     finally:
         conn.close()
+
+# =====================================
+# 로그인 상태 관리 및 데코레이터 (2-4단계)
+# =====================================
+
+def generate_csrf_token():
+    """CSRF 토큰을 생성하는 함수"""
+    if 'csrf_token' not in session:
+        session['csrf_token'] = ''.join(random.choices('0123456789abcdef', k=32))
+    return session['csrf_token']
+
+def is_logged_in():
+    """사용자가 로그인되어 있는지 확인하는 함수"""
+    return session.get('logged_in', False)
+
+def get_current_user():
+    """현재 로그인된 사용자 정보를 반환하는 함수"""
+    if not is_logged_in():
+        return None
+    
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    
+    conn = get_db_connection()
+    try:
+        user = conn.execute('''
+            SELECT id, username, email, created_at 
+            FROM users 
+            WHERE id = ? 
+            LIMIT 1
+        ''', (user_id,)).fetchone()
+        return user
+    except Exception as e:
+        print(f"❌ 사용자 정보 조회 오류: {e}")
+        return None
+    finally:
+        conn.close()
+
+def login_required(f):
+    """로그인이 필요한 페이지를 보호하는 데코레이터"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not is_logged_in():
+            return redirect('/login?message=로그인이 필요한 페이지입니다.')
+        return f(*args, **kwargs)
+    return decorated_function
 
 # 데이터베이스 초기화 함수
 def init_database():
@@ -628,7 +680,15 @@ def add_to_cache(short_code, original_url):
         URL_CACHE[short_code] = original_url
 
 def shorten_url_service(original_url, user_id=None):
-    """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선 + 2-1단계: user_id 지원)"""
+    """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선 + 2-1단계: user_id 지원, 2-6단계: 로그인 필요)"""
+    
+    # 로그인한 사용자만 URL 생성 가능 (2-6단계)
+    if not user_id:
+        return {
+            'success': False,
+            'error': '로그인이 필요한 서비스입니다.',
+            'error_code': 'LOGIN_REQUIRED'
+        }
     
     # URL 유효성 검사 (강화된 버전)
     is_valid, error_message = is_valid_url(original_url)
@@ -642,12 +702,12 @@ def shorten_url_service(original_url, user_id=None):
     # URL 정규화 (앞뒤 공백 제거)
     original_url = original_url.strip()
     
-    # 이미 같은 URL이 있는지 확인
+    # 이미 같은 URL이 있는지 확인 (사용자별로)
     conn = get_db_connection()
     try:
         existing = conn.execute(
-            'SELECT short_code FROM urls WHERE original_url = ? LIMIT 1',
-            (original_url,)
+            'SELECT short_code FROM urls WHERE original_url = ? AND user_id = ? LIMIT 1',
+            (original_url, user_id)
         ).fetchone()
         
         if existing:
@@ -717,8 +777,9 @@ def shorten_url_service(original_url, user_id=None):
 
 # URL 단축 API/폼 엔드포인트 (1-3, 1-5단계)
 @app.route('/shorten', methods=['POST'])
+@login_required
 def shorten_url():
-    """URL을 단축하는 API/폼 엔드포인트 (1-9단계 보안 강화)"""
+    """URL을 단축하는 API/폼 엔드포인트 (1-9단계 보안 강화, 2-6단계: 로그인 필요)"""
     
     # Rate limiting 체크 (1-9단계)
     client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.remote_addr)
@@ -891,6 +952,209 @@ def logout():
     """로그아웃 처리"""
     session.clear()
     return redirect('/?message=로그아웃되었습니다.')
+
+# =====================================
+# 개인 대시보드 및 URL 관리 (2-5단계)
+# =====================================
+
+# 개인 대시보드 (로그인 필요)
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    """사용자 개인 대시보드 페이지"""
+    
+    current_user = get_current_user()
+    if not current_user:
+        return redirect('/login?message=로그인이 필요합니다.')
+    
+    # 디버깅을 위한 로그 추가
+    print(f"🔍 대시보드 접근: 사용자 ID {current_user['id']}, 사용자명 {current_user['username']}")
+    
+    # 사용자의 URL 목록 조회
+    user_urls = get_user_urls(current_user['id'])
+    print(f"📊 조회된 URL 개수: {len(user_urls)}")
+    
+    # URL 목록 HTML 생성
+    if user_urls:
+        url_list_html = ''.join([f'''
+        <div class="url-list">
+            <div class="url-item">
+                <div class="url-info">
+                    <div class="url-title">
+                        <a href="{url['original_url']}" target="_blank" style="color: #007bff; text-decoration: none;">
+                            {url['original_url'][:50]}{'...' if len(url['original_url']) > 50 else ''}
+                        </a>
+                    </div>
+                    <div class="url-details">
+                        단축 코드: <span class="short-code">{url['short_code']}</span> | 
+                        생성일: {url['created_at'][:16].replace('T', ' ')} | 
+                        클릭 수: {url['click_count']}
+                    </div>
+                </div>
+                <div class="url-actions">
+                    <a href="/{url['short_code']}" target="_blank" class="btn btn-primary">🔗 테스트</a>
+                    <a href="/stats/{url['short_code']}" class="btn btn-info">📈 통계</a>
+                    <button onclick="deleteUrl({url['id']}, '{url['short_code']}')" class="btn btn-danger">🗑️ 삭제</button>
+                </div>
+            </div>
+        </div>
+        ''' for url in user_urls])
+    else:
+        url_list_html = '''
+        <div class="empty-state">
+            <div style="font-size: 4rem; margin-bottom: 20px;">📭</div>
+            <h3>아직 생성된 단축 URL이 없습니다</h3>
+            <p>첫 번째 URL을 단축해보세요!</p>
+        </div>
+        '''
+    
+    # 통계 계산
+    total_urls = len(user_urls)
+    total_clicks = sum(url['click_count'] for url in user_urls) if user_urls else 0
+    active_urls = len([url for url in user_urls if url['click_count'] > 0]) if user_urls else 0
+    created_at = current_user['created_at'][:10] if current_user['created_at'] else 'N/A'
+    
+    print(f"📈 통계: 총 URL {total_urls}, 총 클릭 {total_clicks}, 활성 URL {active_urls}, 가입일 {created_at}")
+    
+    # HTML 템플릿에 변수 전달
+    dashboard_html = DASHBOARD_HTML.format(
+        username=current_user['username'],
+        created_at=created_at,
+        total_urls=total_urls,
+        total_clicks=total_clicks,
+        active_urls=active_urls,
+        url_list=url_list_html
+    )
+    
+    return dashboard_html
+
+# URL 삭제 API (사용자 소유 URL만)
+@app.route('/delete-url/<int:url_id>', methods=['POST'])
+@login_required
+def delete_user_url(url_id):
+    """사용자가 소유한 URL을 삭제하는 API"""
+    
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({'success': False, 'error': '로그인이 필요합니다.'}), 401
+    
+    success, message = delete_url_by_user(url_id, current_user['id'])
+    
+    return jsonify({
+        'success': success,
+        'message' if success else 'error': message,
+        'url_id': url_id
+    }), 200 if success else 400
+
+# =====================================
+# 프로필 관리 (2-6단계)
+# =====================================
+
+# 프로필 페이지 (로그인 필요)
+@app.route('/profile', methods=['GET', 'POST'])
+@login_required
+def profile():
+    """사용자 프로필 관리 페이지"""
+    
+    current_user = get_current_user()
+    if not current_user:
+        return redirect('/login?message=로그인이 필요합니다.')
+    
+    if request.method == 'POST':
+        action = request.form.get('action', '')
+        
+        if action == 'change_password':
+            current_password = request.form.get('current_password', '')
+            new_password = request.form.get('new_password', '')
+            confirm_password = request.form.get('confirm_password', '')
+            
+            # 현재 비밀번호 확인
+            success, user = verify_user_credentials(current_user['username'], current_password)
+            if not success:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error_message}', '<div class="error-message">⚠️ 현재 비밀번호가 올바르지 않습니다.</div>')
+            
+            # 새 비밀번호 검증
+            if len(new_password) < 6:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error_message}', '<div class="error-message">⚠️ 새 비밀번호는 최소 6자 이상이어야 합니다.</div>')
+            
+            if new_password != confirm_password:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error_message}', '<div class="error-message">⚠️ 새 비밀번호가 일치하지 않습니다.</div>')
+            
+            # 비밀번호 변경
+            success, message = update_user_password(current_user['id'], new_password)
+            if success:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{success_message}', f'<div class="success-message">✅ {message}</div>')
+            else:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error}', message)
+        
+        elif action == 'delete_account':
+            confirm_password = request.form.get('confirm_password', '')
+            
+            # 비밀번호 확인
+            success, user = verify_user_credentials(current_user['username'], confirm_password)
+            if not success:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error_message}', '<div class="error-message">⚠️ 비밀번호가 올바르지 않습니다.</div>')
+            
+            # 계정 삭제
+            success, message = delete_user_account(current_user['id'])
+            if success:
+                session.clear()
+                return redirect('/?message=계정이 삭제되었습니다.')
+            else:
+                # HTML 템플릿에 변수 전달
+                profile_html = PROFILE_HTML.format(
+                    username=current_user['username'],
+                    email=current_user['email'],
+                    created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A'
+                )
+                return profile_html.replace('{error}', message)
+    
+    # HTML 템플릿에 변수 전달
+    profile_html = PROFILE_HTML.format(
+        username=current_user['username'],
+        email=current_user['email'],
+        created_at=current_user['created_at'][:16].replace('T', ' ') if current_user['created_at'] else 'N/A',
+        success_message='',
+        error_message=''
+    )
+    
+    return profile_html
 
 # =====================================
 # 관리자 페이지 및 통계 기능 (1-7단계)
@@ -2128,6 +2392,11 @@ def main_page():
                 margin-top: 30px;
                 padding-top: 20px;
                 border-top: 1px solid #eee;
+                display: flex;
+                flex-wrap: wrap;
+                justify-content: center;
+                align-items: center;
+                gap: 10px;
             }
             
             .link {
@@ -2300,6 +2569,9 @@ def main_page():
                 font-weight: 600;
                 font-size: 0.9rem;
                 margin: 0 10px;
+                display: inline-flex;
+                align-items: center;
+                white-space: nowrap;
             }
             
             .success-alert {
@@ -2356,6 +2628,69 @@ def main_page():
             .success-close:hover {
                 background-color: rgba(40, 167, 69, 0.1);
             }
+            
+            .login-required-message {
+                background: #f8f9fa;
+                border: 2px solid #e9ecef;
+                border-radius: 15px;
+                padding: 40px;
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            
+            .message-icon {
+                font-size: 4rem;
+                margin-bottom: 20px;
+                opacity: 0.7;
+            }
+            
+            .login-required-message h3 {
+                color: #495057;
+                margin-bottom: 15px;
+                font-size: 1.5rem;
+            }
+            
+            .login-required-message p {
+                color: #6c757d;
+                margin-bottom: 25px;
+                font-size: 1.1rem;
+            }
+            
+            .auth-buttons {
+                display: flex;
+                gap: 15px;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 12px 25px;
+                border: none;
+                border-radius: 10px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                text-decoration: none;
+                display: inline-block;
+                transition: all 0.3s ease;
+                min-width: 140px;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+            }
+            
+            .btn-secondary {
+                background: #f8f9fa;
+                color: #D2691E;
+                border: 2px solid #D2691E;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            }
         </style>
     </head>
     <body>
@@ -2363,7 +2698,25 @@ def main_page():
             <div class="brand-emoji">🥩</div>
             <div class="logo">Cutlet</div>
             <div class="subtitle">Cut your links, serve them fresh</div>
-            <div style="color: #888; font-size: 0.9rem; margin-bottom: 20px; font-style: italic;">빠르고 간편한 URL 단축 서비스</div>
+            <div style="color: #888; font-size: 0.9rem; margin-bottom: 20px; font-style: italic;">
+                ''' + ('빠르고 간편한 URL 단축 서비스' if not session.get('logged_in') else f'환영합니다, {session.get("username", "사용자")}님! 🎉') + '''
+            </div>
+            
+            ''' + ('''
+            <div class="login-required-message">
+                <div class="message-icon">🔒</div>
+                <h3>회원제 서비스입니다</h3>
+                <p>URL 단축 서비스를 이용하려면 먼저 로그인해주세요.<br>무료로 가입하고 모든 기능을 이용하세요!</p>
+                <div class="auth-buttons">
+                    <a href="/login" class="btn btn-primary">🔐 로그인</a>
+                    <a href="/signup" class="btn btn-secondary">📝 회원가입</a>
+                </div>
+            </div>
+            ''' if not session.get('logged_in') else '''
+            <div class="welcome-user" style="background: #e8f5e8; border: 2px solid #28a745; border-radius: 15px; padding: 20px; margin-bottom: 30px; text-align: center;">
+                <div style="font-size: 1.2rem; color: #155724; margin-bottom: 10px;">🎉 로그인되었습니다!</div>
+                <div style="color: #666; font-size: 1rem;">이제 URL 단축 서비스를 자유롭게 이용하실 수 있습니다.</div>
+            </div>
             
             <form class="url-form" action="/shorten" method="POST" onsubmit="showLoading()">
                 <div class="form-group">
@@ -2389,6 +2742,7 @@ def main_page():
                     <span class="loading-text">URL을 단축하는 중입니다...</span>
                 </div>
             </form>
+            ''') + '''
             
             <div class="features">
                 <div class="feature">
@@ -2406,6 +2760,18 @@ def main_page():
                     <div class="feature-title">안전한 링크</div>
                     <div class="feature-desc">유효성 검사 완료</div>
                 </div>
+                ''' + ('''
+                <div class="feature">
+                    <div class="feature-icon">👤</div>
+                    <div class="feature-title">개인 관리</div>
+                    <div class="feature-desc">내 URL 대시보드</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">⚙️</div>
+                    <div class="feature-title">프로필 설정</div>
+                    <div class="feature-desc">계정 관리 및 보안</div>
+                </div>
+                ''' if session.get('logged_in') else '') + '''
             </div>
             
             <div class="links">
@@ -2416,7 +2782,9 @@ def main_page():
                 <a href="/login" class="link">🔐 로그인</a>
                 <a href="/signup" class="link">📝 회원가입</a>
                 ''' if not session.get('logged_in') else f'''
-                <span class="user-info">👤 {session.get('username', '사용자')}</span>
+                <span class="user-info">👤 환영합니다, {session.get('username', '사용자')}님!</span>
+                <a href="/dashboard" class="link">📊 대시보드</a>
+                <a href="/profile" class="link">⚙️ 프로필</a>
                 <a href="/logout" class="link">🚪 로그아웃</a>
                 ''') + '''
             </div>
@@ -3359,16 +3727,88 @@ def get_user_urls(user_id):
     """특정 사용자의 URL 목록을 조회하는 함수"""
     conn = get_db_connection()
     try:
+        print(f"🔍 사용자 ID {user_id}의 URL 조회 중...")
+        
+        # 먼저 해당 사용자 ID로 URL이 있는지 확인
+        count = conn.execute('SELECT COUNT(*) FROM urls WHERE user_id = ?', (user_id,)).fetchone()[0]
+        print(f"📊 사용자 ID {user_id}의 URL 개수: {count}")
+        
+        # 모든 URL을 조회해서 user_id 확인
+        all_urls = conn.execute('SELECT id, original_url, short_code, created_at, click_count, user_id FROM urls').fetchall()
+        print(f"📊 전체 URL 개수: {len(all_urls)}")
+        for url in all_urls:
+            print(f"  - URL ID {url[0]}: user_id = {url[5]}")
+        
         urls = conn.execute('''
             SELECT id, original_url, short_code, created_at, click_count 
             FROM urls 
             WHERE user_id = ? 
             ORDER BY created_at DESC
         ''', (user_id,)).fetchall()
+        
+        print(f"✅ 사용자 ID {user_id}의 URL 조회 완료: {len(urls)}개")
         return urls
     except Exception as e:
         print(f"❌ 사용자 URL 조회 오류: {e}")
         return []
+    finally:
+        conn.close()
+
+def update_user_password(user_id, new_password):
+    """사용자 비밀번호를 업데이트하는 함수"""
+    conn = get_db_connection()
+    try:
+        password_hash = generate_password_hash(new_password)
+        conn.execute('''
+            UPDATE users 
+            SET password_hash = ? 
+            WHERE id = ?
+        ''', (password_hash, user_id))
+        conn.commit()
+        return True, "비밀번호가 성공적으로 변경되었습니다."
+    except Exception as e:
+        return False, f"비밀번호 변경 중 오류가 발생했습니다: {str(e)}"
+    finally:
+        conn.close()
+
+def delete_user_account(user_id):
+    """사용자 계정을 삭제하는 함수"""
+    conn = get_db_connection()
+    try:
+        # 사용자의 URL들을 먼저 삭제
+        conn.execute('DELETE FROM urls WHERE user_id = ?', (user_id,))
+        # 사용자 계정 삭제
+        conn.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        conn.commit()
+        return True, "계정이 성공적으로 삭제되었습니다."
+    except Exception as e:
+        return False, f"계정 삭제 중 오류가 발생했습니다: {str(e)}"
+    finally:
+        conn.close()
+
+def delete_url_by_user(url_id, user_id):
+    """사용자가 소유한 URL을 삭제하는 함수"""
+    conn = get_db_connection()
+    try:
+        # URL이 해당 사용자 소유인지 확인
+        url = conn.execute('''
+            SELECT id, original_url, short_code 
+            FROM urls 
+            WHERE id = ? AND user_id = ? 
+            LIMIT 1
+        ''', (url_id, user_id)).fetchone()
+        
+        if not url:
+            return False, "해당 URL을 찾을 수 없거나 삭제 권한이 없습니다."
+        
+        # URL 삭제
+        conn.execute('DELETE FROM urls WHERE id = ?', (url_id,))
+        conn.commit()
+        
+        return True, f"URL '{url['short_code']}'이(가) 성공적으로 삭제되었습니다."
+        
+    except Exception as e:
+        return False, f"URL 삭제 중 오류가 발생했습니다: {str(e)}"
     finally:
         conn.close()
 
@@ -3524,7 +3964,7 @@ SIGNUP_HTML = '''
         <div class="logo">Cutlet</div>
         <div class="subtitle">회원가입</div>
         
-        ''' + (f'<div class="error-message">⚠️ {error}</div>' if 'error' in locals() else '') + '''
+        ''' + (f'<div class="error-message">⚠️ {{error}}</div>' if 'error' in locals() else '') + '''
         
         <form method="POST" action="/signup">
             <div class="form-group">
@@ -3747,8 +4187,8 @@ LOGIN_HTML = '''
         <div class="logo">Cutlet</div>
         <div class="subtitle">로그인</div>
         
-        ''' + (f'<div class="error-message">⚠️ {error}</div>' if 'error' in locals() else '') + '''
-        ''' + (f'<div class="success-message">✅ {message}</div>' if 'message' in locals() else '') + '''
+        ''' + (f'<div class="error-message">⚠️ {{error}}</div>' if 'error' in locals() else '') + '''
+        ''' + (f'<div class="success-message">✅ {{message}}</div>' if 'message' in locals() else '') + '''
         
         <form method="POST" action="/login">
             <div class="form-group">
@@ -3788,6 +4228,726 @@ LOGIN_HTML = '''
 </body>
 </html>
 '''
+
+# 대시보드 페이지 HTML (2-5단계)
+DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>대시보드 - Cutlet</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }}
+        
+        .header {{
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+        
+        .header h1 {{
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }}
+        
+        .header .user-info {{
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }}
+        
+        .content {{
+            padding: 30px;
+        }}
+        
+        .welcome-section {{
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            text-align: center;
+        }}
+        
+        .welcome-title {{
+            font-size: 1.8rem;
+            color: #495057;
+            margin-bottom: 10px;
+        }}
+        
+        .welcome-subtitle {{
+            color: #6c757d;
+            font-size: 1.1rem;
+        }}
+        
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        
+        .stat-card {{
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border-left: 4px solid #D2691E;
+        }}
+        
+        .stat-number {{
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #D2691E;
+            margin-bottom: 5px;
+        }}
+        
+        .stat-label {{
+            font-size: 0.9rem;
+            color: #666;
+            font-weight: 500;
+        }}
+        
+        .section-title {{
+            font-size: 1.5rem;
+            color: #333;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .url-list {{
+            background: white;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }}
+        
+        .url-item {{
+            padding: 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: background-color 0.3s ease;
+        }}
+        
+        .url-item:hover {{
+            background: #f8f9fa;
+        }}
+        
+        .url-item:last-child {{
+            border-bottom: none;
+        }}
+        
+        .url-info {{
+            flex: 1;
+        }}
+        
+        .url-title {{
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+            font-size: 1.1rem;
+        }}
+        
+        .url-details {{
+            color: #666;
+            font-size: 0.9rem;
+        }}
+        
+        .short-code {{
+            font-family: monospace;
+            background: #e9ecef;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            color: #495057;
+        }}
+        
+        .url-actions {{
+            display: flex;
+            gap: 10px;
+        }}
+        
+        .btn {{
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }}
+        
+        .btn-primary {{
+            background: #007bff;
+            color: white;
+        }}
+        
+        .btn-primary:hover {{
+            background: #0056b3;
+        }}
+        
+        .btn-danger {{
+            background: #dc3545;
+            color: white;
+        }}
+        
+        .btn-danger:hover {{
+            background: #c82333;
+        }}
+        
+        .btn-info {{
+            background: #17a2b8;
+            color: white;
+        }}
+        
+        .btn-info:hover {{
+            background: #138496;
+        }}
+        
+        .empty-state {{
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }}
+        
+        .empty-state i {{
+            font-size: 4rem;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }}
+        
+        .navigation {{
+            padding: 20px 30px;
+            border-top: 1px solid #eee;
+            text-align: center;
+        }}
+        
+        .nav-btn {{
+            padding: 12px 25px;
+            margin: 0 10px;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }}
+        
+        .nav-btn.primary {{
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+        }}
+        
+        .nav-btn.secondary {{
+            background: #f8f9fa;
+            color: #D2691E;
+            border: 2px solid #D2691E;
+        }}
+        
+        .nav-btn:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }}
+        
+        @media (max-width: 768px) {{
+            .content {{
+                padding: 20px;
+            }}
+            
+            .stats-grid {{
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }}
+            
+            .url-item {{
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 15px;
+            }}
+            
+            .url-actions {{
+                width: 100%;
+                justify-content: center;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 개인 대시보드</h1>
+            <div class="user-info">환영합니다, {username}님!</div>
+        </div>
+        
+        <div class="content">
+            <div class="welcome-section">
+                <div class="welcome-title">🥩 Cutlet 대시보드</div>
+                <div class="welcome-subtitle">당신의 URL 단축 서비스 현황을 확인하세요</div>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number">{total_urls}</div>
+                    <div class="stat-label">총 단축 URL</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{total_clicks}</div>
+                    <div class="stat-label">총 클릭 수</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{created_at}</div>
+                    <div class="stat-label">가입일</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">{active_urls}</div>
+                    <div class="stat-label">활성 URL</div>
+                </div>
+            </div>
+            
+            <h2 class="section-title">
+                🔗 내 URL 목록
+                <span style="font-size: 0.8rem; color: #666; font-weight: normal;">(최신순)</span>
+            </h2>
+            
+            {url_list}
+        </div>
+        
+        <div class="navigation">
+            <a href="/" class="nav-btn primary">🔗 새 URL 단축</a>
+            <a href="/profile" class="nav-btn secondary">⚙️ 프로필 설정</a>
+        </div>
+    </div>
+    
+    <script>
+        function deleteUrl(urlId, shortCode) {{
+            if (confirm(`정말로 이 단축 URL을 삭제하시겠습니까?\\n\\n단축 코드: ${{shortCode}}\\n\\n⚠️ 이 작업은 되돌릴 수 없습니다.`)) {{
+                fetch(`/delete-url/${{urlId}}`, {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+    
+                    }}
+                }})
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.success) {{
+                        alert('✅ ' + data.message);
+                        location.reload(); // 페이지 새로고침
+                    }} else {{
+                        alert('❌ ' + data.error);
+                    }}
+                }})
+                .catch(error => {{
+                    console.error('Error:', error);
+                    alert('❌ 삭제 중 오류가 발생했습니다.');
+                }});
+            }}
+        }}
+    </script>
+</body>
+</html>
+'''
+
+# 프로필 페이지 HTML (2-6단계)
+PROFILE_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>프로필 설정 - Cutlet</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        
+        .container {{
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }}
+        
+        .header {{
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+        
+        .header h1 {{
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }}
+        
+        .header .user-info {{
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }}
+        
+        .content {{
+            padding: 30px;
+        }}
+        
+        .profile-section {{
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+        }}
+        
+        .profile-title {{
+            font-size: 1.5rem;
+            color: #495057;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .profile-info {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }}
+        
+        .info-item {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        
+        .info-label {{
+            font-weight: 600;
+            color: #495057;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+        }}
+        
+        .info-value {{
+            color: #333;
+            font-size: 1.1rem;
+        }}
+        
+        .form-section {{
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        
+        .form-title {{
+            font-size: 1.3rem;
+            color: #495057;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .form-group {{
+            margin-bottom: 20px;
+        }}
+        
+        .form-label {{
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 1rem;
+        }}
+        
+        .form-input {{
+            width: 100%;
+            padding: 15px 20px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            outline: none;
+        }}
+        
+        .form-input:focus {{
+            border-color: #D2691E;
+            box-shadow: 0 0 0 3px rgba(210, 105, 30, 0.1);
+        }}
+        
+        .btn {{
+            padding: 12px 25px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }}
+        
+        .btn-primary {{
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+        }}
+        
+        .btn-danger {{
+            background: #dc3545;
+            color: white;
+        }}
+        
+        .btn:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }}
+        
+        .message {{
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: left;
+        }}
+        
+        .success-message {{
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }}
+        
+        .error-message {{
+            background: #fee;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }}
+        
+        .danger-zone {{
+            background: #fff5f5;
+            border: 2px solid #fed7d7;
+            border-radius: 15px;
+            padding: 25px;
+            margin-top: 30px;
+        }}
+        
+        .danger-zone h3 {{
+            color: #c53030;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .danger-zone p {{
+            color: #742a2a;
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }}
+        
+        .navigation {{
+            padding: 20px 30px;
+            border-top: 1px solid #eee;
+            text-align: center;
+        }}
+        
+        .nav-btn {{
+            padding: 12px 25px;
+            margin: 0 10px;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }}
+        
+        .nav-btn.primary {{
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+        }}
+        
+        .nav-btn.secondary {{
+            background: #f8f9fa;
+            color: #D2691E;
+            border: 2px solid #D2691E;
+        }}
+        
+        .nav-btn:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }}
+        
+        @media (max-width: 768px) {{
+            .content {{
+                padding: 20px;
+            }}
+            
+            .profile-info {{
+                grid-template-columns: 1fr;
+            }}
+            
+            .btn {{
+                width: 100%;
+                margin-right: 0;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚙️ 프로필 설정</h1>
+            <div class="user-info">{username}님의 계정 정보</div>
+        </div>
+        
+        <div class="content">
+            {success_message}
+            {error_message}
+            
+            <div class="profile-section">
+                <h2 class="profile-title">👤 계정 정보</h2>
+                <div class="profile-info">
+                    <div class="info-item">
+                        <div class="info-label">사용자명</div>
+                        <div class="info-value">{username}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">이메일</div>
+                        <div class="info-value">{email}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">가입일</div>
+                        <div class="info-value">{created_at}</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h2 class="form-title">🔐 비밀번호 변경</h2>
+                <form method="POST" action="/profile">
+                    <input type="hidden" name="action" value="change_password">
+                    
+                    <div class="form-group">
+                        <label for="current_password" class="form-label">현재 비밀번호</label>
+                        <input 
+                            type="password" 
+                            id="current_password" 
+                            name="current_password" 
+                            class="form-input"
+                            placeholder="현재 비밀번호를 입력하세요"
+                            required
+                        >
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="new_password" class="form-label">새 비밀번호</label>
+                        <input 
+                            type="password" 
+                            id="new_password" 
+                            name="new_password" 
+                            class="form-input"
+                            placeholder="새 비밀번호를 입력하세요 (최소 6자)"
+                            required
+                            minlength="6"
+                        >
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="confirm_password" class="form-label">새 비밀번호 확인</label>
+                        <input 
+                            type="password" 
+                            id="confirm_password" 
+                            name="confirm_password" 
+                            class="form-input"
+                            placeholder="새 비밀번호를 다시 입력하세요"
+                            required
+                            minlength="6"
+                        >
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">
+                        🔐 비밀번호 변경
+                    </button>
+                </form>
+            </div>
+            
+            <div class="danger-zone">
+                <h3>⚠️ 위험 구역</h3>
+                <p>
+                    계정 삭제는 되돌릴 수 없는 작업입니다. 
+                    삭제하면 모든 데이터가 영구적으로 사라집니다.
+                </p>
+                
+                <form method="POST" action="/profile" onsubmit="return confirmDelete()">
+                    <input type="hidden" name="action" value="delete_account">
+                    
+                    <div class="form-group">
+                        <label for="confirm_password" class="form-label">계정 삭제를 위해 비밀번호를 입력하세요</label>
+                        <input 
+                            type="password" 
+                            id="confirm_password" 
+                            name="confirm_password" 
+                            class="form-input"
+                            placeholder="비밀번호를 입력하세요"
+                            required
+                        >
+                    </div>
+                    
+                    <button type="submit" class="btn btn-danger">
+                        🗑️ 계정 삭제
+                    </button>
+                </form>
+            </div>
+        </div>
+        
+        <div class="navigation">
+            <a href="/dashboard" class="nav-btn primary">📊 대시보드</a>
+            <a href="/" class="nav-btn secondary">🏠 메인 페이지</a>
+        </div>
+    </div>
+    
+    <script>
+        function confirmDelete() {{
+            return confirm('정말로 계정을 삭제하시겠습니까?\\n\\n⚠️ 이 작업은 되돌릴 수 없으며, 모든 데이터가 영구적으로 삭제됩니다.\\n\\n계속하시겠습니까?');
+        }}
+    </script>
+</body>
+</html>
+'''
+
+
 
 if __name__ == '__main__':
     # 앱 시작 시 데이터베이스 초기화

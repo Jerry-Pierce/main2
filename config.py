@@ -28,7 +28,7 @@ class Config:
     
     # 서버 설정
     HOST = os.environ.get('HOST') or '0.0.0.0'
-    PORT = int(os.environ.get('PORT') or 8080)
+    PORT = int(os.environ.get('PORT') or 8081)
     
     # 보안 설정
     MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH') or 1048576)  # 1MB

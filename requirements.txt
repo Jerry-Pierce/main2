@@ -3,6 +3,7 @@
 
 # Core Framework
 Flask==3.1.0
+Flask-WTF==1.2.1
 
 # WSGI Server for Production
 gunicorn==23.0.0
