@@ -142,6 +142,26 @@ def create_tables():
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_adimp_short_code ON ad_impressions(short_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_adimp_created_at ON ad_impressions(created_at)')
+        
+        # 광고 클릭 로그 (3-6단계)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS ad_clicks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_id INTEGER,
+                short_code TEXT NOT NULL,
+                viewer_user_id INTEGER,
+                ip TEXT,
+                referrer TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (url_id) REFERENCES urls (id) ON DELETE CASCADE,
+                FOREIGN KEY (viewer_user_id) REFERENCES users (id) ON DELETE SET NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_adclk_short_code ON ad_clicks(short_code)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_adclk_created_at ON ad_clicks(created_at)')
+        
+        # 결제 인덱스 보강
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at)')
 
         # 결제/구독 기반 테이블 (3-4단계)
         conn.execute('''
@@ -2108,6 +2128,77 @@ def subscription_page():
     </body></html>
     '''
 
+# =====================================
+# 3-6단계: 수익 대시보드 (관리자 전용)
+# =====================================
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return redirect('/login?message=로그인이 필요합니다.')
+        if user['user_type'] != 'admin':
+            return redirect('/?error=관리자 전용 페이지입니다.')
+        return f(*args, **kwargs)
+    return wrapper
+
+@app.route('/revenue')
+@login_required
+@admin_required
+def revenue_dashboard():
+    conn = get_db_connection()
+    try:
+        total_users = conn.execute('SELECT COUNT(*) AS c FROM users').fetchone()['c']
+        premium_users = conn.execute("SELECT COUNT(*) AS c FROM users WHERE user_type IN ('premium','admin')").fetchone()['c']
+        ad_imps = conn.execute("SELECT COUNT(*) AS c FROM ad_impressions").fetchone()['c']
+        ad_clicks = conn.execute("SELECT COUNT(*) AS c FROM ad_clicks").fetchone()['c']
+        monthly = conn.execute('''
+            SELECT strftime('%Y-%m', created_at) AS ym, COUNT(*) AS imps
+            FROM ad_impressions
+            GROUP BY ym ORDER BY ym DESC LIMIT 6
+        ''').fetchall()
+        est_revenue = (ad_imps/1000.0)*1.5 + ad_clicks*0.05
+        p30 = conn.execute("SELECT COALESCE(SUM(amount_cents),0) AS s FROM payments WHERE status='success' AND created_at >= datetime('now','-30 day')").fetchone()['s'] or 0
+        est_total = est_revenue + (p30/100.0)
+    finally:
+        conn.close()
+    rows = ''.join([f"<tr><td>{r['ym']}</td><td>{r['imps']}</td><td>${(r['imps']/1000.0)*1.5:.2f}</td></tr>" for r in monthly])
+    return f'''
+    <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>수익 대시보드</title>
+    <style>
+        body {{ font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#f8f9fa; padding:24px; }}
+        .wrap {{ max-width:1100px; margin:0 auto; }}
+        .cards {{ display:grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin-bottom:18px; }}
+        .card {{ background:#fff; border:1px solid #eee; border-radius:16px; box-shadow:0 10px 24px rgba(0,0,0,.06); padding:20px; }}
+        .num {{ font-size:1.8rem; color:#D2691E; font-weight:700; }}
+        table {{ width:100%; border-collapse:collapse; background:#fff; border:1px solid #eee; border-radius:12px; overflow:hidden; }}
+        th,td {{ border-bottom:1px solid #f1f1f1; padding:12px; text-align:center; }}
+        th {{ background:#fafafa; }}
+        .btn {{ display:inline-block; margin-top:12px; padding:10px 16px; border-radius:10px; text-decoration:none; font-weight:600; background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff; }}
+    </style></head>
+    <body>
+        <div class="wrap">
+            <h1>💰 수익 대시보드</h1>
+            <div class="cards">
+                <div class="card"><div>총 사용자 수</div><div class="num">{total_users}</div></div>
+                <div class="card"><div>프리미엄 사용자</div><div class="num">{premium_users}</div></div>
+                <div class="card"><div>광고 노출</div><div class="num">{ad_imps}</div></div>
+                <div class="card"><div>광고 클릭</div><div class="num">{ad_clicks}</div></div>
+                <div class="card"><div>최근 30일 총 예상 수익</div><div class="num">${est_total:.2f}</div><div style="color:#666;font-size:.9rem">(광고 추정 + 프리미엄 결제액)</div></div>
+            </div>
+            <h2>📅 월별 광고 노출 및 추정 수익</h2>
+            <table>
+                <thead><tr><th>월</th><th>노출수</th><th>추정 수익</th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="3">데이터 없음</td></tr>'}</tbody>
+            </table>
+            <div style="text-align:center;">
+                <a class="btn" href="/admin">관리자 페이지로</a>
+            </div>
+        </div>
+    </body></html>
+    '''
+
 # 개별 URL 상세 통계 페이지
 @app.route('/stats/<short_code>')
 def stats_page(short_code):
@@ -3573,6 +3664,10 @@ def ads_page(short_code):
     return f'''
     <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>광고 - Cutlet</title>
     <style>{base_styles}</style>
+    <!-- Google AdSense Placeholder: 실제 배포 시 아래 스크립트를 교체/활성화 -->
+    <!--
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=YOUR-CLIENT-ID" crossorigin="anonymous"></script>
+    -->
     </head><body>
         <div class="wrap">
             <div class="header">
@@ -3581,14 +3676,22 @@ def ads_page(short_code):
             </div>
             <div class="content">
                 <div>
-                    <div class="ad">여기에 광고가 표시됩니다 (AdSense 준비 영역 728×90 또는 970×250)</div>
+                    <div class="ad">
+                        <!-- adsense-top (728x90 / 970x250) -->
+                        <!-- <ins class="adsbygoogle" style="display:block" data-ad-client="YOUR-CLIENT-ID" data-ad-slot="TOP-SLOT" data-ad-format="auto" data-full-width-responsive="true"></ins> -->
+                        여기에 광고가 표시됩니다 (AdSense 준비 영역 728×90 또는 970×250)
+                    </div>
                     <p class="info">원본 페이지: <a href="{original_url}" target="_blank">{original_url}</a></p>
                     <p class="info">광고를 제거하려면 <a href="/pricing" style="color:#D2691E; text-decoration:none; font-weight:700;">프리미엄 가입</a>을 이용하세요.</p>
                     <p class="info">자동 이동까지 <span id="sec" class="countdown">5</span>초</p>
                     <a id="skip" class="btn secondary" href="{original_url}" style="pointer-events:none; opacity:.6;">건너뛰기</a>
                 </div>
                 <div class="sidebar">
-                    <div class="ad">사이드 광고(300×600)</div>
+                    <div class="ad">
+                        <!-- adsense-side (300x600) -->
+                        <!-- <ins class="adsbygoogle" style="display:block" data-ad-client="YOUR-CLIENT-ID" data-ad-slot="SIDE-SLOT" data-ad-format="auto" data-full-width-responsive="true"></ins> -->
+                        사이드 광고(300×600)
+                    </div>
                 </div>
             </div>
             <div class="footer">
@@ -3598,7 +3701,16 @@ def ads_page(short_code):
         <script>
             let s = 5; const sec = document.getElementById('sec'); const skip = document.getElementById('skip');
             const url = {original_url_repr};
-            const timer = setInterval(() => {{ s -= 1; sec.textContent = s; if (s <= 0) {{ clearInterval(timer); skip.style.opacity = '1'; skip.style.pointerEvents = 'auto'; window.location.href = url; }} }}, 1000);
+            const timer = setInterval(() => {{
+                s -= 1; 
+                sec.textContent = s; 
+                if (s <= 0) {{ 
+                    clearInterval(timer); 
+                    skip.style.opacity = '1'; 
+                    skip.style.pointerEvents = 'auto'; 
+                    window.location.href = url; 
+                }} 
+            }}, 1000);
         </script>
     </body></html>
     '''
