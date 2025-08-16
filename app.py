@@ -67,9 +67,13 @@ logging.info(f"Cache size: {CACHE_MAX_SIZE}")
 # 데이터베이스 연결 함수
 def get_db_connection():
     """SQLite 데이터베이스에 연결하는 함수"""
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
-    return conn
+    try:
+        conn = sqlite3.connect(DATABASE, timeout=20.0)
+        conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
+        return conn
+    except Exception as e:
+        logging.error(f"데이터베이스 연결 오류: {e}")
+        raise
 
 # 데이터베이스 테이블 생성 함수
 def create_tables():
@@ -943,6 +947,358 @@ def shorten_url_service(original_url, user_id=None, custom_code=None, expires_at
 
 # =====================================
 # 라우트 (Routes)
+# 에러 핸들러 (4-5단계)
+# =====================================
+
+@app.errorhandler(404)
+def not_found_error(error):
+    """404 에러 페이지"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>404 - 페이지를 찾을 수 없습니다 - Cutlet</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            
+            .error-container {
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                padding: 60px 40px;
+                text-align: center;
+                max-width: 600px;
+                width: 100%;
+            }
+            
+            .error-icon {
+                font-size: 8rem;
+                margin-bottom: 30px;
+                color: #D2691E;
+            }
+            
+            .error-title {
+                font-size: 3rem;
+                color: #333;
+                margin-bottom: 20px;
+                font-weight: bold;
+            }
+            
+            .error-message {
+                font-size: 1.2rem;
+                color: #666;
+                margin-bottom: 40px;
+                line-height: 1.6;
+            }
+            
+            .error-description {
+                font-size: 1rem;
+                color: #888;
+                margin-bottom: 40px;
+                line-height: 1.5;
+            }
+            
+            .action-buttons {
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 15px 30px;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s ease;
+                border: none;
+                cursor: pointer;
+                font-size: 1rem;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+            }
+            
+            .btn-secondary {
+                background: #f8f9fa;
+                color: #D2691E;
+                border: 2px solid #D2691E;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            }
+            
+            .search-box {
+                margin: 30px 0;
+                padding: 20px;
+                background: #f8f9fa;
+                border-radius: 15px;
+            }
+            
+            .search-box input {
+                width: 100%;
+                padding: 15px;
+                border: 2px solid #ddd;
+                border-radius: 10px;
+                font-size: 1rem;
+                margin-bottom: 15px;
+            }
+            
+            .search-box button {
+                width: 100%;
+                padding: 15px;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s ease;
+            }
+            
+            .search-box button:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            }
+            
+            @media (max-width: 768px) {
+                .error-container {
+                    padding: 40px 20px;
+                }
+                
+                .error-title {
+                    font-size: 2.5rem;
+                }
+                
+                .action-buttons {
+                    flex-direction: column;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="error-container">
+            <div class="error-icon">🥩</div>
+            <h1 class="error-title">404</h1>
+            <p class="error-message">페이지를 찾을 수 없습니다</p>
+            <p class="error-description">
+                요청하신 페이지가 존재하지 않거나 이동되었을 수 있습니다.<br>
+                URL을 다시 확인하거나 아래 버튼을 사용해보세요.
+            </p>
+            
+            <div class="search-box">
+                <h3 style="margin-bottom: 15px; color: #333;">🔍 URL 단축하기</h3>
+                <input type="url" id="urlInput" placeholder="https://example.com" required>
+                <button onclick="shortenUrl()">🥩 URL 단축하기</button>
+            </div>
+            
+            <div class="action-buttons">
+                <a href="/" class="btn btn-primary">🏠 홈으로 돌아가기</a>
+                <a href="/help" class="btn btn-secondary">❓ 도움말 보기</a>
+            </div>
+        </div>
+        
+        <script>
+            function shortenUrl() {
+                const urlInput = document.getElementById('urlInput');
+                const url = urlInput.value.trim();
+                
+                if (!url) {
+                    alert('URL을 입력해주세요.');
+                    return;
+                }
+                
+                if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                    alert('올바른 URL 형식을 입력해주세요. (http:// 또는 https:// 포함)');
+                    return;
+                }
+                
+                // URL 단축 요청
+                fetch('/shorten', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        original_url: url
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(`✅ URL 단축 완료!\\n\\n단축된 URL: ${window.location.origin}/${data.short_code}\\n\\n복사하려면 클릭하세요.`);
+                        urlInput.value = '';
+                    } else {
+                        alert('❌ ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('❌ URL 단축 중 오류가 발생했습니다.');
+                });
+            }
+            
+            // Enter 키로 URL 단축
+            document.getElementById('urlInput').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    shortenUrl();
+                }
+            });
+        </script>
+    </body>
+    </html>
+    ''', 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """500 에러 페이지"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>500 - 서버 오류 - Cutlet</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            
+            .error-container {
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                border-left: 4px solid #D2691E;
+            }
+            
+            .error-icon {
+                font-size: 8rem;
+                margin-bottom: 30px;
+                color: #dc3545;
+            }
+            
+            .error-title {
+                font-size: 3rem;
+                color: #333;
+                margin-bottom: 20px;
+                font-weight: bold;
+            }
+            
+            .error-message {
+                font-size: 1.2rem;
+                color: #666;
+                margin-bottom: 40px;
+                line-height: 1.6;
+            }
+            
+            .error-description {
+                font-size: 1rem;
+                color: #888;
+                margin-bottom: 40px;
+                line-height: 1.5;
+            }
+            
+            .action-buttons {
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 15px 30px;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s ease;
+                border: none;
+                cursor: pointer;
+                font-size: 1rem;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+            }
+            
+            .btn-secondary {
+                background: #f8f9fa;
+                color: #D2691E;
+                border: 2px solid #D2691E;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            }
+            
+            @media (max-width: 768px) {
+                .error-container {
+                    padding: 40px 20px;
+                }
+                
+                .error-title {
+                    font-size: 2.5rem;
+                }
+                
+                .action-buttons {
+                    flex-direction: column;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="error-container">
+            <div class="error-icon">⚠️</div>
+            <h1 class="error-title">500</h1>
+            <p class="error-message">서버 내부 오류가 발생했습니다</p>
+            <p class="error-description">
+                죄송합니다. 서버에서 예상치 못한 오류가 발생했습니다.<br>
+                잠시 후 다시 시도해주시거나, 문제가 지속되면 관리자에게 문의해주세요.
+            </p>
+            
+            <div class="action-buttons">
+                <a href="/" class="btn btn-primary">🏠 홈으로 돌아가기</a>
+                <a href="/help" class="btn btn-secondary">❓ 도움말 보기</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    ''', 500
+
 # =====================================
 
 # 벌크 URL 단축 API (4-4단계)
@@ -2008,6 +2364,7 @@ def admin_page():
                 <div class="navigation">
                     <a href="/" class="nav-btn primary">🔗 URL 단축하기</a>
                     <a href="/test" class="nav-btn secondary">🧪 테스트 페이지</a>
+                    <a href="/help" class="nav-btn secondary">❓ 도움말</a>
                 </div>
             </div>
             
@@ -6812,7 +7169,801 @@ PROFILE_HTML = '''
 </html>
 '''
 
+# 도움말/FAQ 페이지 (4-5단계)
+# =====================================
 
+@app.route('/help')
+def help_page():
+    """도움말 및 FAQ 페이지"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>❓ 도움말 및 FAQ - Cutlet</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            
+            .container {
+                max-width: 1000px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                overflow: hidden;
+            }
+            
+            .header {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+                padding: 40px;
+                text-align: center;
+            }
+            
+            .header h1 {
+                font-size: 3rem;
+                margin-bottom: 15px;
+            }
+            
+            .header .subtitle {
+                font-size: 1.2rem;
+                opacity: 0.9;
+            }
+            
+            .content {
+                padding: 40px;
+            }
+            
+            .section {
+                margin-bottom: 40px;
+            }
+            
+            .section-title {
+                font-size: 2rem;
+                color: #D2691E;
+                margin-bottom: 20px;
+                display: flex;
+                align-items: center;
+                gap: 15px;
+            }
+            
+            .faq-item {
+                background: #f8f9fa;
+                border-radius: 15px;
+                padding: 25px;
+                margin-bottom: 20px;
+                border-left: 4px solid #D2691E;
+            }
+            
+            .faq-question {
+                font-size: 1.2rem;
+                font-weight: 600;
+                color: #333;
+                margin-bottom: 15px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            
+            .faq-answer {
+                color: #666;
+                line-height: 1.6;
+                display: none;
+                padding-top: 15px;
+                border-top: 1px solid #dee2e6;
+            }
+            
+            .faq-answer.show {
+                display: block;
+            }
+            
+            .toggle-icon {
+                font-size: 1.5rem;
+                transition: transform 0.3s ease;
+            }
+            
+            .faq-item.active .toggle-icon {
+                transform: rotate(180deg);
+            }
+            
+            .feature-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            
+            .feature-card {
+                background: #f8f9fa;
+                padding: 25px;
+                border-radius: 15px;
+                text-align: center;
+                border-left: 4px solid #D2691E;
+            }
+            
+            .feature-icon {
+                font-size: 3rem;
+                margin-bottom: 15px;
+                color: #D2691E;
+            }
+            
+            .feature-title {
+                font-size: 1.3rem;
+                font-weight: 600;
+                color: #333;
+                margin-bottom: 10px;
+            }
+            
+            .feature-description {
+                color: #666;
+                line-height: 1.5;
+            }
+            
+            .usage-steps {
+                background: #f8f9fa;
+                padding: 30px;
+                border-radius: 15px;
+                margin-bottom: 30px;
+            }
+            
+            .step {
+                display: flex;
+                align-items: center;
+                margin-bottom: 20px;
+                padding: 20px;
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            
+            .step-number {
+                background: #D2691E;
+                color: white;
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: bold;
+                margin-right: 20px;
+                flex-shrink: 0;
+            }
+            
+            .step-content h4 {
+                color: #333;
+                margin-bottom: 8px;
+            }
+            
+            .step-content p {
+                color: #666;
+                margin: 0;
+            }
+            
+            .navigation {
+                padding: 30px 40px;
+                border-top: 1px solid #eee;
+                text-align: center;
+            }
+            
+            .nav-btn {
+                padding: 15px 30px;
+                margin: 0 10px;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s ease;
+            }
+            
+            .nav-btn.primary {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+            }
+            
+            .nav-btn.secondary {
+                background: #f8f9fa;
+                color: #D2691E;
+                border: 2px solid #D2691E;
+            }
+            
+            .nav-btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            }
+            
+            @media (max-width: 768px) {
+                .content {
+                    padding: 20px;
+                }
+                
+                .header h1 {
+                    font-size: 2.5rem;
+                }
+                
+                .feature-grid {
+                    grid-template-columns: 1fr;
+                }
+                
+                .step {
+                    flex-direction: column;
+                    text-align: center;
+                }
+                
+                .step-number {
+                    margin-right: 0;
+                    margin-bottom: 15px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>❓ 도움말 및 FAQ</h1>
+                <div class="subtitle">Cutlet URL Shortener 사용법과 자주 묻는 질문</div>
+            </div>
+            
+            <div class="content">
+                <div class="section">
+                    <h2 class="section-title">🚀 주요 기능</h2>
+                    <div class="feature-grid">
+                        <div class="feature-card">
+                            <div class="feature-icon">🔗</div>
+                            <div class="feature-title">URL 단축</div>
+                            <div class="feature-description">긴 URL을 짧고 기억하기 쉬운 링크로 변환</div>
+                        </div>
+                        <div class="feature-card">
+                            <div class="feature-icon">📊</div>
+                            <div class="feature-title">클릭 통계</div>
+                            <div class="feature-description">단축된 URL의 클릭 수와 상세 분석</div>
+                        </div>
+                        <div class="feature-card">
+                            <div class="feature-icon">📱</div>
+                            <div class="feature-title">QR 코드</div>
+                            <div class="feature-description">모바일에서 쉽게 접근할 수 있는 QR 코드 생성</div>
+                        </div>
+                        <div class="feature-card">
+                            <div class="feature-icon">🏷️</div>
+                            <div class="feature-title">태그 관리</div>
+                            <div class="feature-description">URL을 카테고리별로 분류하고 관리</div>
+                        </div>
+                        <div class="feature-card">
+                            <div class="feature-icon">⭐</div>
+                            <div class="feature-title">즐겨찾기</div>
+                            <div class="feature-description">자주 사용하는 URL을 즐겨찾기로 저장</div>
+                        </div>
+                        <div class="feature-card">
+                            <div class="feature-icon">🚀</div>
+                            <div class="feature-title">벌크 단축</div>
+                            <div class="feature-description">여러 URL을 한 번에 단축 (프리미엄)</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2 class="section-title">📋 사용법</h2>
+                    <div class="usage-steps">
+                        <div class="step">
+                            <div class="step-number">1</div>
+                            <div class="step-content">
+                                <h4>URL 입력</h4>
+                                <p>메인 페이지에 단축하고 싶은 URL을 입력하세요</p>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">2</div>
+                            <div class="step-content">
+                                <h4>옵션 설정 (선택사항)</h4>
+                                <p>커스텀 코드, 만료일, 태그 등을 설정할 수 있습니다</p>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">3</div>
+                            <div class="step-content">
+                                <h4>단축 완료</h4>
+                                <p>짧은 URL이 생성되고 복사할 수 있습니다</p>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">4</div>
+                            <div class="step-content">
+                                <h4>관리 및 분석</h4>
+                                <p>대시보드에서 URL을 관리하고 통계를 확인하세요</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2 class="section-title">❓ 자주 묻는 질문</h2>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            URL 단축은 무료인가요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            네, 기본적인 URL 단축 기능은 완전히 무료입니다. 프리미엄 기능(벌크 단축, 무제한 URL 등)은 월 구독료가 있습니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            단축된 URL은 언제까지 유효한가요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            기본적으로는 무기한 유효합니다. 만료일을 설정하면 해당 날짜 이후에는 접근이 불가능합니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            커스텀 단축 코드를 만들 수 있나요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            네, 원하는 단축 코드를 직접 입력할 수 있습니다. 단, 이미 사용 중인 코드는 사용할 수 없습니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            단축된 URL의 클릭 수를 추적할 수 있나요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            네, 각 단축 URL의 클릭 수, 접근 시간, 사용자 에이전트 등의 상세 정보를 확인할 수 있습니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            여러 URL을 한 번에 단축할 수 있나요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            프리미엄 사용자는 최대 50개의 URL을 한 번에 단축할 수 있습니다. 무료 사용자는 개별적으로 단축해야 합니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            단축된 URL을 삭제할 수 있나요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            네, 언제든지 단축된 URL을 삭제할 수 있습니다. 삭제된 URL은 복구할 수 없습니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            QR 코드는 어떻게 생성하나요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            단축된 URL의 상세 페이지에서 QR 코드 버튼을 클릭하면 QR 코드가 생성됩니다. 모바일에서 쉽게 접근할 수 있습니다.
+                        </div>
+                    </div>
+                    
+                    <div class="faq-item">
+                        <div class="faq-question" onclick="toggleFAQ(this)">
+                            계정을 삭제하면 어떻게 되나요?
+                            <span class="toggle-icon">▼</span>
+                        </div>
+                        <div class="faq-answer">
+                            계정을 삭제하면 모든 단축 URL과 데이터가 영구적으로 삭제됩니다. 이 작업은 되돌릴 수 없습니다.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2 class="section-title">📞 지원 및 문의</h2>
+                    <div style="background: #f8f9fa; padding: 25px; border-radius: 15px; text-align: center;">
+                        <p style="color: #666; margin-bottom: 20px;">
+                            추가 질문이나 문제가 있으시면 언제든지 문의해주세요.
+                        </p>
+                        <div style="display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
+                            <a href="/" class="nav-btn primary">🏠 홈으로 돌아가기</a>
+                            <a href="/dashboard" class="nav-btn secondary">📊 대시보드</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="navigation">
+                <a href="/" class="nav-btn primary">🏠 홈으로 돌아가기</a>
+                <a href="/dashboard" class="nav-btn secondary">📊 대시보드</a>
+            </div>
+        </div>
+        
+        <script>
+            function toggleFAQ(element) {
+                const faqItem = element.parentElement;
+                const answer = faqItem.querySelector('.faq-answer');
+                const icon = element.querySelector('.toggle-icon');
+                
+                if (faqItem.classList.contains('active')) {
+                    faqItem.classList.remove('active');
+                    answer.classList.remove('show');
+                } else {
+                    faqItem.classList.add('active');
+                    answer.classList.add('show');
+                }
+            }
+        </script>
+    </body>
+    </html>
+    '''
+
+# 에러 핸들러 (4-5단계)
+# =====================================
+
+@app.errorhandler(404)
+def not_found_error(error):
+    """404 에러 페이지"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>404 - 페이지를 찾을 수 없습니다 - Cutlet</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            
+            .error-container {
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                padding: 60px 40px;
+                text-align: center;
+                max-width: 600px;
+                width: 100%;
+            }
+            
+            .error-icon {
+                font-size: 8rem;
+                margin-bottom: 30px;
+                color: #D2691E;
+            }
+            
+            .error-title {
+                font-size: 3rem;
+                color: #333;
+                margin-bottom: 20px;
+                font-weight: bold;
+            }
+            
+            .error-message {
+                font-size: 1.2rem;
+                color: #666;
+                margin-bottom: 40px;
+                line-height: 1.6;
+            }
+            
+            .error-description {
+                font-size: 1rem;
+                color: #888;
+                margin-bottom: 40px;
+                line-height: 1.5;
+            }
+            
+            .action-buttons {
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 15px 30px;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s ease;
+                border: none;
+                cursor: pointer;
+                font-size: 1rem;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+            }
+            
+            .btn-secondary {
+                background: #f8f9fa;
+                color: #D2691E;
+                border: 2px solid #D2691E;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            }
+            
+            .search-box {
+                margin: 30px 0;
+                padding: 20px;
+                background: #f8f9fa;
+                border-radius: 15px;
+            }
+            
+            .search-box input {
+                width: 100%;
+                padding: 15px;
+                border: 2px solid #ddd;
+                border-radius: 10px;
+                font-size: 1rem;
+                margin-bottom: 15px;
+            }
+            
+            .search-box button {
+                width: 100%;
+                padding: 15px;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s ease;
+            }
+            
+            .search-box button:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            }
+            
+            @media (max-width: 768px) {
+                .error-container {
+                    padding: 40px 20px;
+                }
+                
+                .error-title {
+                    font-size: 2.5rem;
+                }
+                
+                .action-buttons {
+                    flex-direction: column;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="error-container">
+            <div class="error-icon">🥩</div>
+            <h1 class="error-title">404</h1>
+            <p class="error-message">페이지를 찾을 수 없습니다</p>
+            <p class="error-description">
+                요청하신 페이지가 존재하지 않거나 이동되었을 수 있습니다.<br>
+                URL을 다시 확인하거나 아래 버튼을 사용해보세요.
+            </p>
+            
+            <div class="search-box">
+                <h3 style="margin-bottom: 15px; color: #333;">🔍 URL 단축하기</h3>
+                <input type="url" id="urlInput" placeholder="https://example.com" required>
+                <button onclick="shortenUrl()">🥩 URL 단축하기</button>
+            </div>
+            
+            <div class="action-buttons">
+                <a href="/" class="btn btn-primary">🏠 홈으로 돌아가기</a>
+                <a href="/help" class="btn btn-secondary">❓ 도움말 보기</a>
+            </div>
+        </div>
+        
+        <script>
+            function shortenUrl() {
+                const urlInput = document.getElementById('urlInput');
+                const url = urlInput.value.trim();
+                
+                if (!url) {
+                    alert('URL을 입력해주세요.');
+                    return;
+                }
+                
+                if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                    alert('올바른 URL 형식을 입력해주세요. (http:// 또는 https:// 포함)');
+                    return;
+                }
+                
+                // URL 단축 요청
+                fetch('/shorten', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        original_url: url
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(`✅ URL 단축 완료!\\n\\n단축된 URL: ${window.location.origin}/${data.short_code}\\n\\n복사하려면 클릭하세요.`);
+                        urlInput.value = '';
+                    } else {
+                        alert('❌ ' + data.error);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('❌ URL 단축 중 오류가 발생했습니다.');
+                });
+            }
+            
+            // Enter 키로 URL 단축
+            document.getElementById('urlInput').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    shortenUrl();
+                }
+            });
+        </script>
+    </body>
+    </html>
+    ''', 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """500 에러 페이지"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>500 - 서버 오류 - Cutlet</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            
+            .error-container {
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                padding: 60px 40px;
+                text-align: center;
+                max-width: 600px;
+                width: 100%;
+            }
+            
+            .error-icon {
+                font-size: 8rem;
+                margin-bottom: 30px;
+                color: #dc3545;
+            }
+            
+            .error-title {
+                font-size: 3rem;
+                color: #333;
+                margin-bottom: 20px;
+                font-weight: bold;
+            }
+            
+            .error-message {
+                font-size: 1.2rem;
+                color: #666;
+                margin-bottom: 40px;
+                line-height: 1.6;
+            }
+            
+            .error-description {
+                font-size: 1rem;
+                color: #888;
+                margin-bottom: 40px;
+                line-height: 1.5;
+            }
+            
+            .action-buttons {
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 15px 30px;
+                border-radius: 10px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s ease;
+                border: none;
+                cursor: pointer;
+                font-size: 1rem;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+            }
+            
+            .btn-secondary {
+                background: #f8f9fa;
+                color: #D2691E;
+                border: 2px solid #D2691E;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            }
+            
+            @media (max-width: 768px) {
+                .error-container {
+                    padding: 40px 20px;
+                }
+                
+                .error-title {
+                    font-size: 2.5rem;
+                }
+                
+                .action-buttons {
+                    flex-direction: column;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="error-container">
+            <div class="error-icon">⚠️</div>
+            <h1 class="error-title">500</h1>
+            <p class="error-message">서버 내부 오류가 발생했습니다</p>
+            <p class="error-description">
+                죄송합니다. 서버에서 예상치 못한 오류가 발생했습니다.<br>
+                잠시 후 다시 시도해주시거나, 문제가 지속되면 관리자에게 문의해주세요.
+            </p>
+            
+            <div class="action-buttons">
+                <a href="/" class="btn btn-primary">🏠 홈으로 돌아가기</a>
+                <a href="/help" class="btn btn-secondary">❓ 도움말 보기</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    ''', 500
 
 if __name__ == '__main__':
     # 앱 시작 시 데이터베이스 초기화
