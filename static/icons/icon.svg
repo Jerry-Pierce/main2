@@ -1,0 +1,30 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#D2691E;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#CD853F;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- 배경 원 -->
+  <circle cx="256" cy="256" r="240" fill="url(#grad1)" stroke="#8B4513" stroke-width="8"/>
+  
+  <!-- 가위 모양 -->
+  <g fill="white" stroke="#8B4513" stroke-width="4">
+    <!-- 왼쪽 날 -->
+    <path d="M 120 180 L 200 260 L 180 280 L 100 200 Z"/>
+    <!-- 오른쪽 날 -->
+    <path d="M 392 180 L 312 260 L 332 280 L 412 200 Z"/>
+    <!-- 손잡이 -->
+    <ellipse cx="256" cy="320" rx="60" ry="40"/>
+  </g>
+  
+  <!-- 링크 체인 -->
+  <g fill="none" stroke="white" stroke-width="6" stroke-linecap="round">
+    <path d="M 180 200 Q 200 180 220 200 Q 240 220 260 200 Q 280 180 300 200 Q 320 220 340 200"/>
+    <path d="M 180 220 Q 200 200 220 220 Q 240 240 260 220 Q 280 200 300 220 Q 320 240 340 220"/>
+  </g>
+  
+  <!-- Cutlet 텍스트 -->
+  <text x="256" y="420" font-family="Arial, sans-serif" font-size="48" font-weight="bold" text-anchor="middle" fill="white">CUTLET</text>
+</svg>

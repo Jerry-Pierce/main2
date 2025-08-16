@@ -1,0 +1,61 @@
+{
+  "name": "Cutlet - URL Shortener",
+  "short_name": "Cutlet",
+  "description": "빠르고 안전한 URL 단축 서비스",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#D2691E",
+  "theme_color": "#D2691E",
+  "orientation": "portrait-primary",
+  "scope": "/",
+  "lang": "ko",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/static/icons/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icons/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/static/screenshots/mobile.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "새 URL 단축",
+      "short_name": "단축",
+      "description": "새로운 URL을 단축합니다",
+      "url": "/",
+      "icons": [
+        {
+          "src": "/static/icons/shortcut-96x96.png",
+          "sizes": "96x96"
+        }
+      ]
+    },
+    {
+      "name": "대시보드",
+      "short_name": "대시보드",
+      "description": "내 URL 목록을 확인합니다",
+      "url": "/dashboard",
+      "icons": [
+        {
+          "src": "/static/icons/shortcut-96x96.png",
+          "sizes": "96x96"
+        }
+      ]
+    }
+  ]
+}

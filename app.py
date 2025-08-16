@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect, abort, render_template_string, url_for, session
+from flask import Flask, request, jsonify, redirect, abort, render_template_string, url_for, session, Response, send_from_directory
 import sqlite3
 import re
 import datetime
@@ -12,6 +12,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from config import get_config
 from flask_wtf.csrf import CSRFProtect
+import qrcode
+from io import BytesIO
+import base64
 
 # Flask 애플리케이션 인스턴스 생성
 app = Flask(__name__)
@@ -91,10 +94,13 @@ def create_tables():
             CREATE TABLE IF NOT EXISTS urls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 original_url TEXT NOT NULL,
-                short_code TEXT UNIQUE NOT NULL,
+                short_code TEXT NOT NULL,
                 user_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 click_count INTEGER DEFAULT 0,
+                expires_at TIMESTAMP,
+                tags TEXT,
+                is_favorite INTEGER DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
             )
         ''')
@@ -208,9 +214,30 @@ def migrate_database():
             print("🔄 urls 테이블에 user_id 컬럼을 추가하는 중...")
             conn.execute('ALTER TABLE urls ADD COLUMN user_id INTEGER')
             conn.commit()
-            print("✅ urls 테이블 마이그레이션이 완료되었습니다.")
-        else:
-            print("✅ urls 테이블이 이미 최신 스키마입니다.")
+            print("✅ urls.user_id 마이그레이션 완료")
+        
+        # urls 테이블에 expires_at 컬럼이 있는지 확인
+        if 'expires_at' not in columns:
+            print("🔄 urls 테이블에 expires_at 컬럼을 추가하는 중...")
+            conn.execute('ALTER TABLE urls ADD COLUMN expires_at TIMESTAMP')
+            conn.commit()
+            print("✅ urls.expires_at 마이그레이션 완료")
+        
+        # urls 테이블에 tags 컬럼이 있는지 확인 (4-4단계)
+        if 'tags' not in columns:
+            print("🔄 urls 테이블에 tags 컬럼을 추가하는 중...")
+            conn.execute('ALTER TABLE urls ADD COLUMN tags TEXT')
+            conn.commit()
+            print("✅ urls.tags 마이그레이션 완료")
+        
+        # urls 테이블에 is_favorite 컬럼이 있는지 확인 (4-4단계)
+        if 'is_favorite' not in columns:
+            print("🔄 urls 테이블에 is_favorite 컬럼을 추가하는 중...")
+            conn.execute('ALTER TABLE urls ADD COLUMN is_favorite INTEGER DEFAULT 0')
+            conn.commit()
+            print("✅ urls.is_favorite 마이그레이션 완료")
+        
+        print("✅ urls 테이블이 이미 최신 스키마입니다.")
         
         # users 테이블에 user_type, is_active 컬럼이 있는지 확인
         cursor = conn.execute("PRAGMA table_info(users)")
@@ -339,14 +366,14 @@ def get_all_urls():
         conn.close()
 
 # URL 추가 함수
-def add_url(original_url, short_code, user_id=None):
-    """새로운 URL을 데이터베이스에 추가하는 함수 (2-1단계: user_id 지원)"""
+def add_url(original_url, short_code, user_id=None, expires_at=None, tags=None, is_favorite=False):
+    """새로운 URL을 데이터베이스에 추가하는 함수 (2-1단계: user_id 지원, 4-2단계: 만료일 지원, 4-4단계: 태그/즐겨찾기 지원)"""
     conn = get_db_connection()
     try:
         conn.execute('''
-            INSERT INTO urls (original_url, short_code, user_id) 
-            VALUES (?, ?, ?)
-        ''', (original_url, short_code, user_id))
+            INSERT INTO urls (original_url, short_code, user_id, expires_at, tags, is_favorite) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (original_url, short_code, user_id, expires_at, tags, 1 if is_favorite else 0))
         conn.commit()
         return True
     except Exception as e:
@@ -361,7 +388,7 @@ def get_url_by_short_code(short_code):
     conn = get_db_connection()
     try:
         url_data = conn.execute('''
-            SELECT id, original_url, short_code, created_at, click_count 
+            SELECT id, original_url, short_code, created_at, click_count, expires_at, tags, is_favorite
             FROM urls 
             WHERE short_code = ? 
             LIMIT 1
@@ -801,7 +828,7 @@ def add_to_cache(short_code, original_url):
         
         URL_CACHE[short_code] = original_url
 
-def shorten_url_service(original_url, user_id=None, custom_code=None):
+def shorten_url_service(original_url, user_id=None, custom_code=None, expires_at=None, tags=None, is_favorite=False):
     """URL을 단축하고 데이터베이스에 저장하는 서비스 함수 (1-6단계 개선 + 2-1단계: user_id 지원, 2-6단계: 로그인 필요)"""
     
     # 로그인한 사용자만 URL 생성 가능 (2-6단계)
@@ -879,8 +906,8 @@ def shorten_url_service(original_url, user_id=None, custom_code=None):
         else:
             short_code = generate_unique_short_code(6)  # 6글자 코드 생성
         
-        # 데이터베이스에 저장 (user_id 포함)
-        success = add_url(original_url, short_code, user_id)
+        # 데이터베이스에 저장 (user_id 포함, 만료일 포함, 태그/즐겨찾기 포함)
+        success = add_url(original_url, short_code, user_id, expires_at, tags, is_favorite)
         
         if success:
             # 단축 URL 생성
@@ -918,6 +945,142 @@ def shorten_url_service(original_url, user_id=None, custom_code=None):
 # 라우트 (Routes)
 # =====================================
 
+# 벌크 URL 단축 API (4-4단계)
+@app.route('/bulk-shorten', methods=['POST'])
+@login_required
+def bulk_shorten():
+    """여러 URL을 한 번에 단축하는 API (프리미엄 전용)"""
+    
+    # 프리미엄 사용자 확인
+    current_user = get_current_user()
+    if current_user['user_type'] not in ('premium', 'admin'):
+        return jsonify({
+            'success': False,
+            'error': '벌크 URL 단축은 프리미엄 전용 기능입니다.',
+            'error_code': 'PREMIUM_REQUIRED'
+        }), 403
+    
+    try:
+        data = request.get_json()
+        if not data or 'urls' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'URL 목록이 필요합니다.',
+                'error_code': 'MISSING_URLS'
+            }), 400
+        
+        urls = data.get('urls', [])
+        tags = data.get('tags', '')
+        expires_at = data.get('expires_at', 'never')
+        
+        if not urls or len(urls) > 50:  # 최대 50개 URL
+            return jsonify({
+                'success': False,
+                'error': 'URL은 1-50개까지 처리 가능합니다.',
+                'error_code': 'INVALID_URL_COUNT'
+            }), 400
+        
+        # 만료일 처리
+        expires_at_datetime = None
+        if expires_at and expires_at != 'never':
+            if expires_at == '1day':
+                expires_at_datetime = datetime.datetime.now() + datetime.timedelta(days=1)
+            elif expires_at == '7days':
+                expires_at_datetime = datetime.datetime.now() + datetime.timedelta(days=7)
+            elif expires_at == '30days':
+                expires_at_datetime = datetime.datetime.now() + datetime.timedelta(days=30)
+        
+        results = []
+        success_count = 0
+        
+        for url_data in urls:
+            original_url = url_data.get('url', '').strip()
+            custom_code = url_data.get('custom_code', '').strip()
+            is_favorite = url_data.get('is_favorite', False)
+            
+            if not original_url:
+                results.append({
+                    'url': original_url,
+                    'success': False,
+                    'error': 'URL이 비어있습니다.'
+                })
+                continue
+            
+            # URL 유효성 검사
+            is_valid, error_message = is_valid_url(original_url)
+            if not is_valid:
+                results.append({
+                    'url': original_url,
+                    'success': False,
+                    'error': error_message
+                })
+                continue
+            
+            # 커스텀 코드 중복 체크
+            if custom_code:
+                if not re.match(r'^[A-Za-z0-9-]{3,20}$', custom_code):
+                    results.append({
+                        'url': original_url,
+                        'success': False,
+                        'error': '커스텀 코드는 3-20자 영문/숫자/하이픈만 가능합니다.'
+                    })
+                    continue
+                
+                conn = get_db_connection()
+                try:
+                    exists = conn.execute('SELECT 1 FROM urls WHERE short_code = ? LIMIT 1', (custom_code,)).fetchone()
+                    if exists:
+                        results.append({
+                            'url': original_url,
+                            'success': False,
+                            'error': '이미 사용 중인 커스텀 코드입니다.'
+                        })
+                        continue
+                finally:
+                    conn.close()
+            
+            # 단축 코드 생성
+            short_code = custom_code if custom_code else generate_unique_short_code(6)
+            
+            # 데이터베이스에 저장
+            success = add_url(original_url, short_code, current_user['id'], expires_at_datetime, tags, is_favorite)
+            
+            if success:
+                base_url = request.host_url.rstrip('/')
+                short_url = f"{base_url}/{short_code}"
+                
+                # 캐시에 추가
+                add_to_cache(short_code, original_url)
+                
+                results.append({
+                    'url': original_url,
+                    'success': True,
+                    'short_code': short_code,
+                    'short_url': short_url,
+                    'is_favorite': is_favorite
+                })
+                success_count += 1
+            else:
+                results.append({
+                    'url': original_url,
+                    'success': False,
+                    'error': 'URL 저장 중 오류가 발생했습니다.'
+                })
+        
+        return jsonify({
+            'success': True,
+            'total_urls': len(urls),
+            'success_count': success_count,
+            'results': results
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'벌크 처리 중 오류가 발생했습니다: {str(e)}',
+            'error_code': 'INTERNAL_ERROR'
+        }), 500
+
 # URL 단축 API/폼 엔드포인트 (1-3, 1-5단계)
 @app.route('/shorten', methods=['POST'])
 @login_required
@@ -954,6 +1117,9 @@ def shorten_url():
             # 폼 데이터 요청
             original_url = request.form.get('original_url', '').strip()
             custom_code = request.form.get('custom_code', '').strip()
+            expires_at = request.form.get('expires_at', '').strip()
+            tags = request.form.get('tags', '').strip()
+            is_favorite = request.form.get('is_favorite', '') == 'on'
             is_form_request = True
         
         # original_url이 없으면 에러
@@ -997,7 +1163,17 @@ def shorten_url():
             finally:
                 conn.close()
 
-        result = shorten_url_service(original_url, user_id, custom_for_service)
+        # 만료일 처리
+        expires_at_datetime = None
+        if expires_at and expires_at != 'never':
+            if expires_at == '1day':
+                expires_at_datetime = datetime.datetime.now() + datetime.timedelta(days=1)
+            elif expires_at == '7days':
+                expires_at_datetime = datetime.datetime.now() + datetime.timedelta(days=7)
+            elif expires_at == '30days':
+                expires_at_datetime = datetime.datetime.now() + datetime.timedelta(days=30)
+        
+        result = shorten_url_service(original_url, user_id, custom_for_service, expires_at_datetime, tags, is_favorite)
         
         if is_form_request:
             # 폼 요청의 경우 결과 페이지로 리다이렉트
@@ -1145,7 +1321,7 @@ def dashboard():
     if user_urls:
         url_list_html = ''.join([f'''
         <div class="url-list">
-            <div class="url-item">
+            <div class="url-item" style="{'border-left: 4px solid #ffc107; background-color: #fff3cd;' if url['expires_at'] and (datetime.datetime.fromisoformat(url['expires_at']) - datetime.datetime.now()).days <= 3 else ''}">
                 <div class="url-info">
                     <div class="url-title">
                         <a href="{url['original_url']}" target="_blank" style="color: #007bff; text-decoration: none;">
@@ -1155,13 +1331,20 @@ def dashboard():
                     <div class="url-details">
                         단축 코드: <span class="short-code">{url['short_code']}</span> | 
                         생성일: {url['created_at'][:16].replace('T', ' ')} | 
-                        클릭 수: {url['click_count']}
+                        클릭 수: {url['click_count']} | 
+                        만료일: {url['expires_at'][:16].replace('T', ' ') if url['expires_at'] else '무기한'} | 
+                        태그: {url['tags'] if url['tags'] else '없음'} | 
+                        상태: <span style="color: {'#dc3545' if url['expires_at'] and datetime.datetime.fromisoformat(url['expires_at']) < datetime.datetime.now() else '#28a745' if url['expires_at'] and (datetime.datetime.fromisoformat(url['expires_at']) - datetime.datetime.now()).days <= 3 else '#6c757d'}">{'만료됨' if url['expires_at'] and datetime.datetime.fromisoformat(url['expires_at']) < datetime.datetime.now() else '만료 임박' if url['expires_at'] and (datetime.datetime.fromisoformat(url['expires_at']) - datetime.datetime.now()).days <= 3 else '활성'}</span>
                     </div>
                 </div>
                 <div class="url-actions">
                     <a href="/{url['short_code']}" target="_blank" class="btn btn-primary">🔗 테스트</a>
                     <a href="/stats/{url['short_code']}" class="btn btn-info">📈 통계</a>
-                <a href="/analytics/{url['short_code']}" class="btn btn-info">🔬 상세 분석</a>
+                    <a href="/analytics/{url['short_code']}" class="btn btn-info">🔬 상세 분석</a>
+                    <a href="/qr/{url['short_code']}" class="btn btn-success">📱 QR 코드</a>
+                    <button onclick="toggleFavorite({url['id']}, this)" class="btn {'btn-warning' if url['is_favorite'] else 'btn-secondary'}" style="{'background: #ffc107; color: #000;' if url['is_favorite'] else 'background: #6c757d; color: white;'}">
+                        {'⭐ 즐겨찾기 해제' if url['is_favorite'] else '☆ 즐겨찾기'}
+                    </button>
                     <button onclick="deleteUrl({url['id']}, '{url['short_code']}')" class="btn btn-danger">🗑️ 삭제</button>
                 </div>
             </div>
@@ -1180,13 +1363,31 @@ def dashboard():
     total_urls = len(user_urls)
     total_clicks = sum(url['click_count'] for url in user_urls) if user_urls else 0
     active_urls = len([url for url in user_urls if url['click_count'] > 0]) if user_urls else 0
-    created_at = current_user['created_at'][:10] if current_user['created_at'] else 'N/A'
+    
+    # 가입일 안전하게 설정 (4-4단계 수정)
+    try:
+        if current_user.get('created_at'):
+            created_at = current_user['created_at'][:10] if isinstance(current_user['created_at'], str) else 'N/A'
+        else:
+            created_at = 'N/A'
+    except:
+        created_at = 'N/A'
     # (2-7단계) 이번 달 사용량
     used_this_month = count_user_urls_this_month(current_user['id'])
     limit_total, is_unlimited = get_user_limit_info(current_user)
     usage_text = (f"이번 달 {used_this_month}/{limit_total}개 사용 중" if not is_unlimited else "프리미엄(무제한)")
     
     print(f"📈 통계: 총 URL {total_urls}, 총 클릭 {total_clicks}, 활성 URL {active_urls}, 가입일 {created_at}")
+    
+    # 프리미엄 사용자 확인 (4-4단계)
+    is_premium = current_user['user_type'] in ('premium', 'admin')
+    
+    # 벌크 단축 버튼 HTML 생성
+    bulk_button = '''
+                    <button onclick="showBulkShorten()" class="btn btn-primary" style="border: none; padding: 8px 16px; border-radius: 8px; background: #007bff; color: white; font-size: 0.9rem; cursor: pointer;">
+                        🚀 벌크 단축
+                    </button>
+                    ''' if is_premium else ''
     
     # HTML 템플릿에 변수 전달
     dashboard_html = DASHBOARD_HTML.format(
@@ -1196,10 +1397,50 @@ def dashboard():
         total_clicks=total_clicks,
         active_urls=active_urls,
         url_list=url_list_html,
-        usage_text=usage_text
+        usage_text=usage_text,
+        bulk_button=bulk_button
     )
     
     return dashboard_html
+
+# URL 즐겨찾기 토글 API (4-4단계)
+@app.route('/toggle-favorite/<int:url_id>', methods=['POST'])
+@login_required
+def toggle_favorite(url_id):
+    """URL 즐겨찾기 상태를 토글하는 API"""
+    
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({'success': False, 'error': '로그인이 필요합니다.'}), 401
+    
+    conn = get_db_connection()
+    try:
+        # URL이 해당 사용자 소유인지 확인
+        url = conn.execute('''
+            SELECT id, is_favorite 
+            FROM urls 
+            WHERE id = ? AND user_id = ? 
+            LIMIT 1
+        ''', (url_id, current_user['id'])).fetchone()
+        
+        if not url:
+            return jsonify({'success': False, 'error': '해당 URL을 찾을 수 없거나 권한이 없습니다.'}), 404
+        
+        # 즐겨찾기 상태 토글
+        new_favorite_status = 0 if url['is_favorite'] else 1
+        conn.execute('UPDATE urls SET is_favorite = ? WHERE id = ?', (new_favorite_status, url_id))
+        conn.commit()
+        
+        return jsonify({
+            'success': True,
+            'is_favorite': bool(new_favorite_status),
+            'message': '즐겨찾기로 설정되었습니다.' if new_favorite_status else '즐겨찾기가 해제되었습니다.'
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'즐겨찾기 변경 중 오류가 발생했습니다: {str(e)}'}), 500
+    finally:
+        conn.close()
 
 # URL 삭제 API (사용자 소유 URL만)
 @app.route('/delete-url/<int:url_id>', methods=['POST'])
@@ -1218,6 +1459,51 @@ def delete_user_url(url_id):
         'message' if success else 'error': message,
         'url_id': url_id
     }), 200 if success else 400
+
+# CSV 내보내기 API (4-4단계)
+@app.route('/export-csv')
+@login_required
+def export_csv():
+    """사용자의 URL 목록을 CSV로 내보내기"""
+    
+    current_user = get_current_user()
+    if not current_user:
+        return redirect('/login?message=로그인이 필요합니다.')
+    
+    conn = get_db_connection()
+    try:
+        urls = conn.execute('''
+            SELECT original_url, short_code, created_at, click_count, expires_at, tags, is_favorite
+            FROM urls 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+        ''', (current_user['id'],)).fetchall()
+        
+        # CSV 데이터 생성
+        csv_data = "원본 URL,단축 코드,생성일,클릭 수,만료일,태그,즐겨찾기\n"
+        
+        for url in urls:
+            original_url = url['original_url'].replace('"', '""')  # CSV 이스케이프
+            short_code = url['short_code']
+            created_at = url['created_at'][:19].replace('T', ' ') if url['created_at'] else ''
+            click_count = str(url['click_count'])
+            expires_at = url['expires_at'][:19].replace('T', ' ') if url['expires_at'] else '무기한'
+            tags = url['tags'] if url['tags'] else ''
+            is_favorite = '⭐' if url['is_favorite'] else ''
+            
+            csv_data += f'"{original_url}","{short_code}","{created_at}",{click_count},"{expires_at}","{tags}","{is_favorite}"\n'
+        
+        # CSV 파일 응답
+        response = Response(csv_data, mimetype='text/csv; charset=utf-8')
+        response.headers['Content-Disposition'] = f'attachment; filename="cutlet_urls_{current_user["username"]}_{datetime.datetime.now().strftime("%Y%m%d")}.csv"'
+        
+        return response
+        
+    except Exception as e:
+        print(f"❌ CSV 내보내기 오류: {e}")
+        return redirect('/dashboard?error=CSV 내보내기 중 오류가 발생했습니다.')
+    finally:
+        conn.close()
 
 # =====================================
 # 프로필 관리 (2-6단계)
@@ -2199,6 +2485,121 @@ def revenue_dashboard():
     </body></html>
     '''
 
+# =====================================
+# 4-1단계: QR 코드 생성 기능
+# =====================================
+
+def generate_qr_code(url, size=10, border=4):
+    """QR 코드를 생성하고 base64 인코딩된 이미지를 반환합니다."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=size,
+        border=border,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # 이미지를 BytesIO에 저장
+    img_buffer = BytesIO()
+    img.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
+    
+    # base64로 인코딩
+    img_base64 = base64.b64encode(img_buffer.getvalue()).decode()
+    return img_base64
+
+@app.route('/qr/<short_code>')
+def qr_page(short_code):
+    """QR 코드 표시 페이지"""
+    conn = get_db_connection()
+    try:
+        url_data = conn.execute('SELECT * FROM urls WHERE short_code = ?', (short_code,)).fetchone()
+        if not url_data:
+            return redirect('/?error=존재하지 않는 단축 URL입니다.')
+        
+        full_url = f"http://{request.host}/{short_code}"
+        qr_image = generate_qr_code(full_url)
+        
+        return f'''
+        <!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>QR 코드 - {short_code}</title>
+        <style>
+            body {{ font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); min-height:100vh; padding:20px; display:flex; align-items:center; justify-content:center; }}
+            .container {{ background:#fff; border-radius:20px; box-shadow:0 20px 40px rgba(0,0,0,0.1); padding:40px; max-width:500px; width:100%; text-align:center; }}
+            .title {{ font-size:2rem; color:#D2691E; font-weight:bold; margin-bottom:20px; }}
+            .qr-container {{ background:#f8f9fa; border-radius:15px; padding:30px; margin:20px 0; }}
+            .qr-image {{ max-width:100%; height:auto; border-radius:10px; }}
+            .url-info {{ background:#e9f7ef; border-radius:10px; padding:15px; margin:15px 0; word-break:break-all; }}
+            .original-url {{ color:#666; font-size:0.9rem; margin-top:10px; }}
+            .btn {{ display:inline-block; margin:10px 5px; padding:12px 20px; border-radius:10px; text-decoration:none; font-weight:600; transition:all 0.3s ease; }}
+            .btn-primary {{ background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:#fff; }}
+            .btn-secondary {{ background:#6c757d; color:#fff; }}
+            .btn:hover {{ transform:translateY(-2px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }}
+        </style></head>
+        <body>
+            <div class="container">
+                <div class="title">📱 QR 코드</div>
+                <div class="url-info">
+                    <strong>단축 URL:</strong> {full_url}<br>
+                    <div class="original-url">원본: {url_data['original_url']}</div>
+                </div>
+                <div class="qr-container">
+                    <img src="data:image/png;base64,{qr_image}" alt="QR 코드" class="qr-image">
+                </div>
+                <div>
+                    <a href="/qr/{short_code}/download" class="btn btn-primary">📥 PNG 다운로드</a>
+                    <a href="/dashboard" class="btn btn-secondary">📊 대시보드로</a>
+                    <a href="/" class="btn btn-secondary">🏠 메인으로</a>
+                </div>
+                <div style="margin-top:20px; color:#666; font-size:0.9rem;">
+                    QR 코드를 스캔하면 단축 URL로 바로 이동합니다.
+                </div>
+            </div>
+        </body></html>
+        '''
+    finally:
+        conn.close()
+
+@app.route('/qr/<short_code>/download')
+def qr_download(short_code):
+    """QR 코드 PNG 다운로드"""
+    conn = get_db_connection()
+    try:
+        url_data = conn.execute('SELECT * FROM urls WHERE short_code = ?', (short_code,)).fetchone()
+        if not url_data:
+            return redirect('/?error=존재하지 않는 단축 URL입니다.')
+        
+        full_url = f"http://{request.host}/{short_code}"
+        
+        # QR 코드 생성 (다운로드용으로 더 큰 사이즈)
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=15,  # 더 큰 사이즈
+            border=4,
+        )
+        qr.add_data(full_url)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        # BytesIO에 저장
+        img_buffer = BytesIO()
+        img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        # Response 생성
+        return Response(
+            img_buffer.getvalue(),
+            mimetype='image/png',
+            headers={'Content-Disposition': f'attachment; filename="qr_{short_code}.png"'}
+        )
+        
+    finally:
+        conn.close()
+
 # 개별 URL 상세 통계 페이지
 @app.route('/stats/<short_code>')
 def stats_page(short_code):
@@ -2647,6 +3048,13 @@ def redirect_to_original(short_code):
         cached_url = get_from_cache(short_code)
         if cached_url:
             logging.info(f"Cache hit for {short_code} -> {cached_url}")
+            # 만료 체크 (4-2단계)
+            url_data = get_url_by_short_code(short_code)
+            if url_data and url_data.get('expires_at'):
+                expires_at = datetime.datetime.fromisoformat(url_data['expires_at'])
+                if datetime.datetime.now() > expires_at:
+                    return redirect(url_for('expired_link', short_code=short_code))
+            
             # 프리미엄은 바로 이동, 무료는 광고 페이지로 이동
             user = get_current_user()
             if user and user['user_type'] in ('premium','admin'):
@@ -2667,6 +3075,12 @@ def redirect_to_original(short_code):
             print(f"⚠️ 존재하지 않는 단축 코드: {short_code}")
             abort(404)
         
+        # 만료 체크 (4-2단계)
+        if url_data.get('expires_at'):
+            expires_at = datetime.datetime.fromisoformat(url_data['expires_at'])
+            if datetime.datetime.now() > expires_at:
+                return redirect(url_for('expired_link', short_code=short_code))
+        
         # 조회된 URL을 캐시에 저장
         original_url = url_data['original_url']
         add_to_cache(short_code, original_url)
@@ -2686,6 +3100,359 @@ def redirect_to_original(short_code):
     except Exception as e:
         print(f"❌ 리다이렉트 오류: {e}")
         abort(500)
+
+# 만료된 링크 안내 페이지 (4-2단계)
+@app.route('/expired/<short_code>')
+def expired_link(short_code):
+    """만료된 링크에 대한 안내 페이지"""
+    return f'''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>링크 만료 - Cutlet</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{ 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }}
+            .container {{
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                padding: 40px;
+                max-width: 600px;
+                width: 100%;
+                text-align: center;
+            }}
+            .expired-icon {{
+                font-size: 4rem;
+                color: #dc3545;
+                margin-bottom: 20px;
+            }}
+            .title {{
+                font-size: 2rem;
+                font-weight: bold;
+                color: #333;
+                margin-bottom: 10px;
+            }}
+            .message {{
+                font-size: 1.1rem;
+                color: #666;
+                margin-bottom: 30px;
+                line-height: 1.6;
+            }}
+            .btn {{
+                display: inline-block;
+                padding: 12px 24px;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+                text-decoration: none;
+                border-radius: 10px;
+                font-weight: 600;
+                transition: transform 0.2s;
+            }}
+            .btn:hover {{
+                transform: translateY(-2px);
+            }}
+            .short-code {{
+                background: #f8f9fa;
+                padding: 10px;
+                border-radius: 8px;
+                font-family: monospace;
+                color: #666;
+                margin: 20px 0;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="expired-icon">⏰</div>
+            <h1 class="title">링크가 만료되었습니다</h1>
+            <p class="message">
+                요청하신 단축 링크 <span class="short-code">{short_code}</span>는 만료되었습니다.<br>
+                링크의 소유자에게 새로운 링크를 요청하거나,<br>
+                직접 URL을 입력하여 접속해주세요.
+            </p>
+            <a href="/" class="btn">홈으로 돌아가기</a>
+        </div>
+    </body>
+    </html>
+    '''
+
+# PWA 관련 라우트 (4-3단계)
+@app.route('/manifest.json')
+def manifest():
+    """PWA manifest.json 파일 제공"""
+    return send_from_directory('.', 'manifest.json', mimetype='application/json')
+
+@app.route('/sw.js')
+def service_worker():
+    """Service Worker 파일 제공"""
+    return send_from_directory('static', 'sw.js', mimetype='application/javascript')
+
+@app.route('/offline.html')
+def offline_page():
+    """오프라인 페이지 제공"""
+    return send_from_directory('static', 'offline.html')
+
+@app.route('/pwa-test')
+def pwa_test():
+    """PWA 기능 테스트 페이지"""
+    return '''
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>PWA 테스트 - Cutlet</title>
+        <meta name="theme-color" content="#D2691E">
+        <link rel="manifest" href="/manifest.json">
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                padding: 40px;
+            }
+            .title {
+                font-size: 2.5rem;
+                color: #D2691E;
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            .test-section {
+                background: #f8f9fa;
+                padding: 20px;
+                border-radius: 15px;
+                margin: 20px 0;
+            }
+            .test-title {
+                font-size: 1.3rem;
+                color: #333;
+                margin-bottom: 15px;
+            }
+            .test-item {
+                display: flex;
+                align-items: center;
+                margin: 10px 0;
+                padding: 10px;
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+            .test-icon {
+                font-size: 1.5rem;
+                margin-right: 15px;
+                width: 30px;
+                text-align: center;
+            }
+            .test-text {
+                color: #495057;
+                flex: 1;
+            }
+            .test-status {
+                font-weight: bold;
+                padding: 5px 10px;
+                border-radius: 5px;
+                font-size: 0.9rem;
+            }
+            .status-success { background: #d4edda; color: #155724; }
+            .status-error { background: #f8d7da; color: #721c24; }
+            .status-warning { background: #fff3cd; color: #856404; }
+            .btn {
+                display: inline-block;
+                padding: 12px 24px;
+                background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+                color: white;
+                text-decoration: none;
+                border-radius: 10px;
+                font-weight: 600;
+                margin: 10px;
+                border: none;
+                cursor: pointer;
+            }
+            .btn:hover { transform: translateY(-2px); }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1 class="title">📱 PWA 기능 테스트</h1>
+            
+            <div class="test-section">
+                <h2 class="test-title">🔧 PWA 기본 기능</h2>
+                <div class="test-item">
+                    <div class="test-icon">📋</div>
+                    <div class="test-text">Manifest.json</div>
+                    <div class="test-status status-success" id="manifestStatus">확인 중...</div>
+                </div>
+                <div class="test-item">
+                    <div class="test-icon">⚙️</div>
+                    <div class="test-text">Service Worker</div>
+                    <div class="test-status status-success" id="swStatus">확인 중...</div>
+                </div>
+                <div class="test-item">
+                    <div class="test-icon">🎨</div>
+                    <div class="test-text">앱 아이콘</div>
+                    <div class="test-status status-success" id="iconStatus">확인 중...</div>
+                </div>
+            </div>
+            
+            <div class="test-section">
+                <h2 class="test-title">📱 설치 기능</h2>
+                <div class="test-item">
+                    <div class="test-icon">📥</div>
+                    <div class="test-text">설치 프롬프트</div>
+                    <div class="test-status status-warning" id="installStatus">대기 중...</div>
+                </div>
+                <div class="test-item">
+                    <div class="test-icon">🏠</div>
+                    <div class="test-text">홈 화면 추가</div>
+                    <div class="test-status status-warning" id="homeStatus">대기 중...</div>
+                </div>
+            </div>
+            
+            <div class="test-section">
+                <h2 class="test-title">🌐 네트워크 상태</h2>
+                <div class="test-item">
+                    <div class="test-icon">📡</div>
+                    <div class="test-text">온라인 상태</div>
+                    <div class="test-status status-success" id="onlineStatus">확인 중...</div>
+                </div>
+                <div class="test-item">
+                    <div class="test-icon">💾</div>
+                    <div class="test-text">캐시 상태</div>
+                    <div class="test-status status-success" id="cacheStatus">확인 중...</div>
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+                <button onclick="runTests()" class="btn">🧪 테스트 실행</button>
+                <button onclick="installPWA()" class="btn" id="installBtn" style="display: none;">📱 앱 설치</button>
+                <a href="/" class="btn">🏠 홈으로</a>
+            </div>
+        </div>
+        
+        <script>
+            let deferredPrompt;
+            
+            // PWA 설치 프롬프트 감지
+            window.addEventListener('beforeinstallprompt', (e) => {
+                e.preventDefault();
+                deferredPrompt = e;
+                document.getElementById('installBtn').style.display = 'inline-block';
+                document.getElementById('installStatus').textContent = '사용 가능';
+                document.getElementById('installStatus').className = 'test-status status-success';
+            });
+            
+            // 설치 버튼 클릭
+            function installPWA() {
+                if (deferredPrompt) {
+                    deferredPrompt.prompt();
+                    deferredPrompt.userChoice.then((choiceResult) => {
+                        if (choiceResult.outcome === 'accepted') {
+                            document.getElementById('installStatus').textContent = '설치됨';
+                            document.getElementById('homeStatus').textContent = '사용 가능';
+                            document.getElementById('installBtn').style.display = 'none';
+                        }
+                        deferredPrompt = null;
+                    });
+                }
+            }
+            
+            // 테스트 실행
+            function runTests() {
+                // Manifest 확인
+                fetch('/manifest.json')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('manifestStatus').textContent = '정상';
+                        document.getElementById('manifestStatus').className = 'test-status status-success';
+                    })
+                    .catch(() => {
+                        document.getElementById('manifestStatus').textContent = '오류';
+                        document.getElementById('manifestStatus').className = 'test-status status-error';
+                    });
+                
+                // Service Worker 확인
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.getRegistrations()
+                        .then(registrations => {
+                            if (registrations.length > 0) {
+                                document.getElementById('swStatus').textContent = '등록됨';
+                                document.getElementById('swStatus').className = 'test-status status-success';
+                            } else {
+                                document.getElementById('swStatus').textContent = '미등록';
+                                document.getElementById('swStatus').className = 'test-status status-warning';
+                            }
+                        });
+                } else {
+                    document.getElementById('swStatus').textContent = '지원 안됨';
+                    document.getElementById('swStatus').className = 'test-status status-error';
+                }
+                
+                // 아이콘 확인
+                const icon = new Image();
+                icon.onload = () => {
+                    document.getElementById('iconStatus').textContent = '정상';
+                    document.getElementById('iconStatus').className = 'test-status status-success';
+                };
+                icon.onerror = () => {
+                    document.getElementById('iconStatus').textContent = '오류';
+                    document.getElementById('iconStatus').className = 'test-status status-error';
+                };
+                icon.src = '/static/icons/icon-192x192.png';
+                
+                // 온라인 상태
+                document.getElementById('onlineStatus').textContent = navigator.onLine ? '온라인' : '오프라인';
+                document.getElementById('onlineStatus').className = navigator.onLine ? 'test-status status-success' : 'test-status status-warning';
+                
+                // 캐시 상태
+                if ('caches' in window) {
+                    caches.keys()
+                        .then(keys => {
+                            document.getElementById('cacheStatus').textContent = keys.length > 0 ? '활성' : '비활성';
+                            document.getElementById('cacheStatus').className = keys.length > 0 ? 'test-status status-success' : 'test-status status-warning';
+                        });
+                } else {
+                    document.getElementById('cacheStatus').textContent = '지원 안됨';
+                    document.getElementById('cacheStatus').className = 'test-status status-error';
+                }
+            }
+            
+            // Service Worker 등록
+            if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('/sw.js')
+                    .then(registration => {
+                        console.log('✅ Service Worker 등록 성공:', registration.scope);
+                    })
+                    .catch(error => {
+                        console.log('❌ Service Worker 등록 실패:', error);
+                    });
+            }
+            
+            // 페이지 로드 시 자동 테스트
+            window.addEventListener('load', runTests);
+        </script>
+    </body>
+    </html>
+    '''
 
 # 404 에러 핸들러
 @app.errorhandler(404)
@@ -2894,7 +3661,22 @@ def main_page():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>🥩 Cutlet - Cut your links, serve them fresh</title>
-        <link rel="icon" href="/favicon.ico" type="image/svg+xml">
+        
+        <!-- PWA 메타 태그 (4-3단계) -->
+        <meta name="theme-color" content="#D2691E">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="default">
+        <meta name="apple-mobile-web-app-title" content="Cutlet">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="msapplication-TileColor" content="#D2691E">
+        <meta name="msapplication-config" content="/browserconfig.xml">
+        
+        <!-- PWA 링크 -->
+        <link rel="manifest" href="/manifest.json">
+        <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192x192.png">
+        <link rel="icon" type="image/png" sizes="512x512" href="/static/icons/icon-512x512.png">
+        <link rel="apple-touch-icon" href="/static/icons/icon-192x192.png">
+        <link rel="shortcut icon" href="/static/icons/icon-192x192.png">
         <style>
             * {
                 margin: 0;
@@ -3391,6 +4173,44 @@ def main_page():
                     <div style="font-size:0.9rem;color:#888;margin-top:6px;">예: cutlet.me/my-awesome-link • 무료 사용자는 <a href="/pricing" style="color:#D2691E; text-decoration:none;">프리미엄 업그레이드</a> 후 이용 가능합니다.</div>
                 </div>
                 
+                <div class="form-group">
+                    <label for="expires_at" class="form-label">만료일 설정 (선택사항)</label>
+                    <select id="expires_at" name="expires_at" class="url-input">
+                        <option value="never">무기한</option>
+                        <option value="1day">1일 후</option>
+                        <option value="7days">7일 후</option>
+                        <option value="30days">30일 후</option>
+                    </select>
+                    <div style="font-size:0.9rem;color:#888;margin-top:6px;">링크의 자동 만료일을 설정할 수 있습니다. 만료된 링크는 접속할 수 없습니다.</div>
+                </div>
+                
+                <div class="form-group">
+                    <label for="tags" class="form-label">태그 (선택사항)</label>
+                    <input 
+                        type="text"
+                        id="tags"
+                        name="tags"
+                        class="url-input"
+                        placeholder="예: #마케팅 #개인 #업무"
+                        pattern="[#\w\s]+"
+                        title="태그는 #으로 시작하고 영문/숫자/공백만 허용합니다"
+                    >
+                    <div style="font-size:0.9rem;color:#888;margin-top:6px;">태그를 입력하면 URL을 쉽게 분류하고 찾을 수 있습니다. #으로 시작하는 태그를 입력하세요.</div>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">
+                        <input 
+                            type="checkbox"
+                            id="is_favorite"
+                            name="is_favorite"
+                            style="margin-right: 8px;"
+                        >
+                        ⭐ 즐겨찾기로 설정
+                    </label>
+                    <div style="font-size:0.9rem;color:#888;margin-top:6px;">중요한 URL을 즐겨찾기로 설정하면 대시보드에서 쉽게 찾을 수 있습니다.</div>
+                </div>
+                
                 <button type="submit" class="submit-btn" id="submitBtn">
                     🚀 URL 단축하기
                 </button>
@@ -3463,6 +4283,76 @@ def main_page():
                 loadingDiv.style.display = 'block';
                 
                 return true; // 폼 제출 계속
+            }
+            
+            // PWA 설치 프롬프트 (4-3단계)
+            let deferredPrompt;
+            
+            window.addEventListener('beforeinstallprompt', (e) => {
+                e.preventDefault();
+                deferredPrompt = e;
+                
+                // 설치 버튼 표시
+                showInstallButton();
+            });
+            
+            function showInstallButton() {
+                // 설치 버튼이 이미 있으면 중복 생성 방지
+                if (document.getElementById('installButton')) return;
+                
+                const installBtn = document.createElement('div');
+                installBtn.id = 'installButton';
+                installBtn.innerHTML = `
+                    <div style="position: fixed; top: 20px; right: 20px; z-index: 1000; background: white; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); padding: 15px; max-width: 300px;">
+                        <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                            <span style="font-size: 1.5rem; margin-right: 10px;">📱</span>
+                            <div>
+                                <div style="font-weight: bold; color: #333;">Cutlet 앱 설치</div>
+                                <div style="font-size: 0.9rem; color: #666;">홈 화면에 추가하여 더 편리하게 사용하세요</div>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 10px;">
+                            <button onclick="installApp()" style="background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); color: white; border: none; padding: 8px 16px; border-radius: 8px; font-weight: 600; cursor: pointer;">설치</button>
+                            <button onclick="dismissInstall()" style="background: #f8f9fa; color: #666; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer;">나중에</button>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(installBtn);
+            }
+            
+            function installApp() {
+                if (deferredPrompt) {
+                    deferredPrompt.prompt();
+                    deferredPrompt.userChoice.then((choiceResult) => {
+                        if (choiceResult.outcome === 'accepted') {
+                            console.log('✅ PWA 설치 완료');
+                        } else {
+                            console.log('❌ PWA 설치 취소됨');
+                        }
+                        deferredPrompt = null;
+                        dismissInstall();
+                    });
+                }
+            }
+            
+            function dismissInstall() {
+                const installBtn = document.getElementById('installButton');
+                if (installBtn) {
+                    installBtn.remove();
+                }
+            }
+            
+            // Service Worker 등록 (4-3단계)
+            if ('serviceWorker' in navigator) {
+                window.addEventListener('load', () => {
+                    navigator.serviceWorker.register('/sw.js')
+                        .then((registration) => {
+                            console.log('✅ Service Worker 등록 성공:', registration.scope);
+                        })
+                        .catch((error) => {
+                            console.log('❌ Service Worker 등록 실패:', error);
+                        });
+                });
             }
             
             // API 문서 안내
@@ -3629,6 +4519,13 @@ def ads_page(short_code):
     url = get_url_by_short_code(short_code)
     if not url:
         abort(404)
+    
+    # 만료 체크 (4-2단계)
+    if url.get('expires_at'):
+        expires_at = datetime.datetime.fromisoformat(url['expires_at'])
+        if datetime.datetime.now() > expires_at:
+            return redirect(url_for('expired_link', short_code=short_code))
+    
     original_url = url['original_url']
     # 광고 노출 기록
     conn = get_db_connection()
@@ -3699,9 +4596,11 @@ def ads_page(short_code):
             </div>
         </div>
         <script>
-            let s = 5; const sec = document.getElementById('sec'); const skip = document.getElementById('skip');
+            let s = 5; 
+            const sec = document.getElementById('sec'); 
+            const skip = document.getElementById('skip');
             const url = {original_url_repr};
-            const timer = setInterval(() => {{
+            const timer = setInterval(function() {{
                 s -= 1; 
                 sec.textContent = s; 
                 if (s <= 0) {{ 
@@ -4548,7 +5447,7 @@ def get_user_urls(user_id):
             print(f"  - URL ID {url[0]}: user_id = {url[5]}")
         
         urls = conn.execute('''
-            SELECT id, original_url, short_code, created_at, click_count 
+            SELECT id, original_url, short_code, created_at, click_count, expires_at, tags, is_favorite
             FROM urls 
             WHERE user_id = ? 
             ORDER BY created_at DESC
@@ -5238,6 +6137,15 @@ DASHBOARD_HTML = '''
             background: #138496;
         }}
         
+        .btn-success {{
+            background: #28a745;
+            color: white;
+        }}
+        
+        .btn-success:hover {{
+            background: #218838;
+        }}
+        
         .empty-state {{
             text-align: center;
             padding: 60px 20px;
@@ -5336,10 +6244,18 @@ DASHBOARD_HTML = '''
                 </div>
             </div>
             
-            <h2 class="section-title">
-                🔗 내 URL 목록
-                <span style="font-size: 0.8rem; color: #666; font-weight: normal;">(최신순)</span>
-            </h2>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h2 class="section-title" style="margin: 0;">
+                    🔗 내 URL 목록
+                    <span style="font-size: 0.8rem; color: #666; font-weight: normal;">(최신순)</span>
+                </h2>
+                <div style="display: flex; gap: 10px;">
+                    <a href="/export-csv" class="btn btn-success" style="text-decoration: none; padding: 8px 16px; border-radius: 8px; background: #28a745; color: white; font-size: 0.9rem;">
+                        📊 CSV 내보내기
+                    </a>
+                    {bulk_button}
+                </div>
+            </div>
             
             {url_list}
         </div>
@@ -5350,20 +6266,123 @@ DASHBOARD_HTML = '''
         </div>
     </div>
     
-    <script>
-        function deleteUrl(urlId, shortCode) {{
-            if (confirm(`정말로 이 단축 URL을 삭제하시겠습니까?\\n\\n단축 코드: ${{shortCode}}\\n\\n⚠️ 이 작업은 되돌릴 수 없습니다.`)) {{
-                fetch(`/delete-url/${{urlId}}`, {{
+            <!-- 벌크 URL 단축 모달 (4-4단계) -->
+        <div id="bulkModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
+            <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 20px; max-width: 600px; width: 90%; max-height: 80vh; overflow-y: auto;">
+                <h3 style="margin-bottom: 20px; color: #D2691E;">🚀 벌크 URL 단축</h3>
+                <p style="color: #666; margin-bottom: 20px;">여러 URL을 한 번에 단축할 수 있습니다. (최대 50개)</p>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold;">공통 태그 (선택사항)</label>
+                    <input type="text" id="bulkTags" placeholder="예: #벌크 #마케팅" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px;">
+                </div>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold;">공통 만료일 (선택사항)</label>
+                    <select id="bulkExpiresAt" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px;">
+                        <option value="never">무기한</option>
+                        <option value="1day">1일 후</option>
+                        <option value="7days">7일 후</option>
+                        <option value="30days">30일 후</option>
+                    </select>
+                </div>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold;">URL 목록 (한 줄에 하나씩)</label>
+                    <textarea id="bulkUrls" placeholder="https://example1.com&#10;https://example2.com&#10;https://example3.com" style="width: 100%; height: 200px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; font-family: monospace;"></textarea>
+                </div>
+                
+                <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                    <button onclick="closeBulkModal()" style="padding: 10px 20px; border: 1px solid #ddd; background: #f8f9fa; border-radius: 8px; cursor: pointer;">취소</button>
+                    <button onclick="submitBulkUrls()" style="padding: 10px 20px; background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); color: white; border: none; border-radius: 8px; cursor: pointer;">🚀 단축하기</button>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // 즐겨찾기 토글 함수 (4-4단계)
+            function toggleFavorite(urlId, button) {{
+                fetch(`/toggle-favorite/${{urlId}}`, {{
                     method: 'POST',
                     headers: {{
-                        'Content-Type': 'application/json',
-    
+                        'Content-Type': 'application/json'
                     }}
                 }})
                 .then(response => response.json())
                 .then(data => {{
                     if (data.success) {{
+                        // 버튼 상태 업데이트
+                        if (data.is_favorite) {{
+                            button.textContent = '⭐ 즐겨찾기 해제';
+                            button.className = 'btn btn-warning';
+                            button.style.background = '#ffc107';
+                            button.style.color = '#000';
+                        }} else {{
+                            button.textContent = '☆ 즐겨찾기';
+                            button.className = 'btn btn-secondary';
+                            button.style.background = '#6c757d';
+                            button.style.color = 'white';
+                        }}
                         alert('✅ ' + data.message);
+                    }} else {{
+                        alert('❌ ' + data.error);
+                    }}
+                }})
+                .catch(error => {{
+                    console.error('Error:', error);
+                    alert('❌ 즐겨찾기 변경 중 오류가 발생했습니다.');
+                }});
+            }}
+            
+            // 벌크 URL 단축 모달 표시
+            function showBulkShorten() {{
+                document.getElementById('bulkModal').style.display = 'block';
+            }}
+            
+            // 벌크 URL 단축 모달 닫기
+            function closeBulkModal() {{
+                document.getElementById('bulkModal').style.display = 'none';
+            }}
+            
+            // 벌크 URL 제출
+            function submitBulkUrls() {{
+                const urlsText = document.getElementById('bulkUrls').value.trim();
+                const tags = document.getElementById('bulkTags').value.trim();
+                const expiresAt = document.getElementById('bulkExpiresAt').value;
+                
+                if (!urlsText) {{
+                    alert('URL을 입력해주세요.');
+                    return;
+                }}
+                
+                const urls = urlsText.split('\\n').filter(url => url.trim()).map(url => ({{
+                    url: url.trim(),
+                    is_favorite: false
+                }}));
+                
+                if (urls.length > 50) {{
+                    alert('URL은 최대 50개까지 처리 가능합니다.');
+                    return;
+                }}
+                
+                const data = {{
+                    urls: urls,
+                    tags: tags,
+                    expires_at: expiresAt
+                }};
+                
+                fetch('/bulk-shorten', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify(data)
+                }})
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.success) {{
+                        alert(`✅ 벌크 단축 완료!\\n총 ${{data.total_urls}}개 중 ${{data.success_count}}개 성공`);
+                        closeBulkModal();
                         location.reload(); // 페이지 새로고침
                     }} else {{
                         alert('❌ ' + data.error);
@@ -5371,11 +6390,35 @@ DASHBOARD_HTML = '''
                 }})
                 .catch(error => {{
                     console.error('Error:', error);
-                    alert('❌ 삭제 중 오류가 발생했습니다.');
+                    alert('❌ 벌크 단축 중 오류가 발생했습니다.');
                 }});
             }}
-        }}
-    </script>
+            
+            function deleteUrl(urlId, shortCode) {{
+                if (confirm(`정말로 이 단축 URL을 삭제하시겠습니까?\\n\\n단축 코드: ${{shortCode}}\\n\\n⚠️ 이 작업은 되돌릴 수 없습니다.`)) {{
+                    fetch(`/delete-url/${{urlId}}`, {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+    
+                        }}
+                    }})
+                    .then(response => response.json())
+                    .then(data => {{
+                        if (data.success) {{
+                            alert('✅ ' + data.message);
+                            location.reload(); // 페이지 새로고침
+                        }} else {{
+                            alert('❌ ' + data.error);
+                        }}
+                    }})
+                    .catch(error => {{
+                        console.error('Error:', error);
+                        alert('❌ 삭제 중 오류가 발생했습니다.');
+                    }});
+                }}
+            }}
+        </script>
 </body>
 </html>
 '''

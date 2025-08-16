@@ -11,6 +11,10 @@ gunicorn==23.0.0
 # Environment Variables Management
 python-dotenv==1.1.0
 
+# QR Code Generation (4-1단계)
+qrcode[pil]==7.4.2
+cairosvg==2.7.1
+
 # Optional: Database (for PostgreSQL in production)
 # psycopg2-binary==2.9.7
 
