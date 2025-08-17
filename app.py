@@ -227,6 +227,30 @@ def create_tables():
     finally:
         conn.close()
 
+# 글로벌 국가 코드 및 전화번호 형식 정의
+COUNTRIES = [
+    {'code': '+82', 'name': '대한민국', 'flag': '🇰🇷', 'pattern': r'^\+82\s?1[0-9]\s?[0-9]{4}\s?[0-9]{4}$'},
+    {'code': '+1', 'name': '미국/캐나다', 'flag': '🇺🇸', 'pattern': r'^\+1\s?[0-9]{3}\s?[0-9]{3}\s?[0-9]{4}$'},
+    {'code': '+44', 'name': '영국', 'flag': '🇬🇧', 'pattern': r'^\+44\s?[0-9]{4}\s?[0-9]{6}$'},
+    {'code': '+81', 'name': '일본', 'flag': '🇯🇵', 'pattern': r'^\+81\s?[0-9]{2}\s?[0-9]{4}\s?[0-9]{4}$'},
+    {'code': '+86', 'name': '중국', 'flag': '🇨🇳', 'pattern': r'^\+86\s?1[0-9]{2}\s?[0-9]{4}\s?[0-9]{4}$'},
+    {'code': '+49', 'name': '독일', 'flag': '🇩🇪', 'pattern': r'^\+49\s?[0-9]{3,4}\s?[0-9]{4,8}$'},
+    {'code': '+33', 'name': '프랑스', 'flag': '🇫🇷', 'pattern': r'^\+33\s?[0-9]{1}\s?[0-9]{2}\s?[0-9]{2}\s?[0-9]{2}\s?[0-9]{2}$'},
+    {'code': '+39', 'name': '이탈리아', 'flag': '🇮🇹', 'pattern': r'^\+39\s?[0-9]{3}\s?[0-9]{3}\s?[0-9]{4}$'},
+    {'code': '+34', 'name': '스페인', 'flag': '🇪🇸', 'pattern': r'^\+34\s?[0-9]{3}\s?[0-9]{3}\s?[0-9]{3}$'},
+    {'code': '+31', 'name': '네덜란드', 'flag': '🇳🇱', 'pattern': r'^\+31\s?[0-9]{2}\s?[0-9]{8}$'},
+    {'code': '+46', 'name': '스웨덴', 'flag': '🇸🇪', 'pattern': r'^\+46\s?[0-9]{2,3}\s?[0-9]{6,7}$'},
+    {'code': '+47', 'name': '노르웨이', 'flag': '🇳🇴', 'pattern': r'^\+47\s?[0-9]{8}$'},
+    {'code': '+45', 'name': '덴마크', 'flag': '🇩🇰', 'pattern': r'^\+45\s?[0-9]{2}\s?[0-9]{2}\s?[0-9]{2}\s?[0-9]{2}$'},
+    {'code': '+358', 'name': '핀란드', 'flag': '🇫🇮', 'pattern': r'^\+358\s?[0-9]{2}\s?[0-9]{3}\s?[0-9]{4}$'},
+    {'code': '+7', 'name': '러시아', 'flag': '🇷🇺', 'pattern': r'^\+7\s?[0-9]{3}\s?[0-9]{3}\s?[0-9]{2}\s?[0-9]{2}$'},
+    {'code': '+91', 'name': '인도', 'flag': '🇮🇳', 'pattern': r'^\+91\s?[0-9]{5}\s?[0-9]{5}$'},
+    {'code': '+61', 'name': '호주', 'flag': '🇦🇺', 'pattern': r'^\+61\s?[0-9]{1}\s?[0-9]{4}\s?[0-9]{4}$'},
+    {'code': '+64', 'name': '뉴질랜드', 'flag': '🇳🇿', 'pattern': r'^\+64\s?[0-9]{2}\s?[0-9]{3}\s?[0-9]{4}$'},
+    {'code': '+55', 'name': '브라질', 'flag': '🇧🇷', 'pattern': r'^\+55\s?[0-9]{2}\s?[0-9]{5}\s?[0-9]{4}$'},
+    {'code': '+52', 'name': '멕시코', 'flag': '🇲🇽', 'pattern': r'^\+52\s?[0-9]{3}\s?[0-9]{3}\s?[0-9]{4}$'}
+]
+
 # 데이터베이스 마이그레이션 함수 (2-1단계)
 def migrate_database():
     """기존 데이터베이스를 새로운 스키마로 마이그레이션하는 함수"""
@@ -279,6 +303,18 @@ def migrate_database():
             conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
             conn.commit()
             print("✅ users.is_active 마이그레이션 완료")
+        
+        # users 테이블에 전화번호 관련 컬럼 추가
+        if 'country_code' not in user_columns:
+            print("🔄 users 테이블에 country_code 컬럼을 추가하는 중...")
+            conn.execute("ALTER TABLE users ADD COLUMN country_code TEXT")
+            conn.commit()
+            print("✅ users.country_code 마이그레이션 완료")
+        if 'phone_number' not in user_columns:
+            print("🔄 users 테이블에 phone_number 컬럼을 추가하는 중...")
+            conn.execute("ALTER TABLE users ADD COLUMN phone_number TEXT")
+            conn.commit()
+            print("✅ users.phone_number 마이그레이션 완료")
         
         # 비밀번호 재설정 토큰 테이블 확인 및 생성
         cursor = conn.execute("PRAGMA table_info(password_reset_tokens)")
@@ -1756,36 +1792,53 @@ def signup():
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         email = request.form.get('email', '').strip()
+        country_code = request.form.get('country_code', '').strip()
+        phone_number = request.form.get('phone_number', '').strip()
         password = request.form.get('password', '')
         confirm_password = request.form.get('confirm_password', '')
         
-        print(f"🔍 회원가입 요청: username={username}, email={email}")
+        print(f"🔍 회원가입 요청: username={username}, email={email}, phone={country_code}{phone_number}")
         
-        # 입력 검증
+        # 필수 필드 검증
         if not username or not email or not password:
-            error_msg = "모든 필드를 입력해주세요."
+            error_msg = "사용자명, 이메일, 비밀번호는 필수입니다."
             print(f"❌ 검증 실패: {error_msg}")
             return render_template_string(SIGNUP_HTML, error=error_msg)
         
+        # 사용자명 길이 검증
         if len(username) < 3 or len(username) > 20:
             error_msg = "사용자명은 3-20자 사이여야 합니다."
             print(f"❌ 검증 실패: {error_msg}")
             return render_template_string(SIGNUP_HTML, error=error_msg)
         
+        # 비밀번호 길이 검증
         if len(password) < 6:
             error_msg = "비밀번호는 최소 6자 이상이어야 합니다."
             print(f"❌ 검증 실패: {error_msg}")
             return render_template_string(SIGNUP_HTML, error=error_msg)
         
+        # 비밀번호 확인 검증
         if password != confirm_password:
             error_msg = "비밀번호가 일치하지 않습니다."
             print(f"❌ 검증 실패: {error_msg}")
             return render_template_string(SIGNUP_HTML, error=error_msg)
         
+        # 전화번호 유효성 검사 (전화번호가 입력된 경우)
+        if phone_number and country_code:
+            is_valid, phone_error = validate_phone_number(country_code, phone_number)
+            if not is_valid:
+                error_msg = f"전화번호 오류: {phone_error}"
+                print(f"❌ 전화번호 검증 실패: {error_msg}")
+                return render_template_string(SIGNUP_HTML, error=error_msg)
+        elif phone_number and not country_code:
+            error_msg = "전화번호를 입력하려면 국가를 선택해주세요."
+            print(f"❌ 검증 실패: {error_msg}")
+            return render_template_string(SIGNUP_HTML, error=error_msg)
+        
         print(f"✅ 검증 통과, 사용자 생성 시도...")
         
-        # 사용자 생성
-        success, message = create_user(username, email, password)
+        # 사용자 생성 (전화번호 정보 포함)
+        success, message = create_user(username, email, password, country_code, phone_number)
         
         if success:
             print(f"✅ 사용자 생성 성공: {username}")
@@ -2073,9 +2126,17 @@ def dashboard():
                     </button>
                     ''' if is_premium else ''
     
+    # 전화번호 마스킹 처리
+    phone_display = mask_phone_number(
+        current_user['country_code'],
+        current_user['phone_number']
+    )
+    
     # HTML 템플릿에 변수 전달
     dashboard_html = DASHBOARD_HTML.format(
         username=current_user['username'],
+        email=current_user.get('email', 'N/A'),
+        phone_display=phone_display,
         created_at=created_at,
         total_urls=total_urls,
         total_clicks=total_clicks,
@@ -5997,8 +6058,45 @@ curl -X POST http://localhost:8080/shorten \\<br>
 # 사용자 관리 함수들 (2-1단계)
 # =====================================
 
-def create_user(username, email, password):
-    """새로운 사용자를 생성하는 함수 (이메일 소문자 정규화)"""
+def validate_phone_number(country_code, phone_number):
+    """전화번호 유효성 검사 함수"""
+    import re
+    
+    # 전체 전화번호 (국가코드 포함)
+    full_phone = f"{country_code}{phone_number}"
+    
+    # 해당 국가의 패턴 찾기
+    country_pattern = None
+    for country in COUNTRIES:
+        if country['code'] == country_code:
+            country_pattern = country['pattern']
+            break
+    
+    if not country_pattern:
+        return False, "지원하지 않는 국가 코드입니다."
+    
+    # 패턴 검사
+    if not re.match(country_pattern, full_phone):
+        return False, "전화번호 형식이 올바르지 않습니다."
+    
+    return True, "전화번호가 유효합니다."
+
+def mask_phone_number(country_code, phone_number):
+    """전화번호를 마스킹하여 표시하는 함수"""
+    if not phone_number or not country_code:
+        return "등록되지 않음"
+    
+    # 전화번호에서 중간 부분을 *로 마스킹
+    if len(phone_number) >= 8:
+        # 중간 4자리를 *로 마스킹
+        masked = phone_number[:len(phone_number)//2-2] + "****" + phone_number[len(phone_number)//2+2:]
+        return f"{country_code} {masked}"
+    else:
+        # 짧은 전화번호는 그대로 표시
+        return f"{country_code} {phone_number}"
+
+def create_user(username, email, password, country_code=None, phone_number=None):
+    """새로운 사용자를 생성하는 함수 (이메일 소문자 정규화 + 전화번호 지원)"""
     conn = get_db_connection()
     try:
         # 이메일을 소문자로 정규화
@@ -6013,13 +6111,30 @@ def create_user(username, email, password):
         if existing_user:
             return False, f"이미 사용 중인 이메일입니다: {email_normalized}"
         
+        # 사용자명 중복 체크
+        existing_user = conn.execute('''
+            SELECT username FROM users WHERE username = ?
+        ''', (username,)).fetchone()
+        
+        if existing_user:
+            return False, "이미 사용 중인 사용자명입니다."
+        
+        # 전화번호 중복 체크 (전화번호가 제공된 경우)
+        if phone_number and country_code:
+            existing_user = conn.execute('''
+                SELECT username FROM users WHERE country_code = ? AND phone_number = ?
+            ''', (country_code, phone_number)).fetchone()
+            
+            if existing_user:
+                return False, "이미 등록된 전화번호입니다."
+        
         conn.execute('''
-            INSERT INTO users (username, email, password_hash, user_type, is_active) 
-            VALUES (?, ?, ?, 'free', 1)
-        ''', (username, email_normalized, password_hash))
+            INSERT INTO users (username, email, password_hash, user_type, is_active, country_code, phone_number) 
+            VALUES (?, ?, ?, 'free', 1, ?, ?)
+        ''', (username, email_normalized, password_hash, country_code, phone_number))
         conn.commit()
         
-        logging.info(f"새 사용자 생성 성공: {username} ({email_normalized})")
+        logging.info(f"새 사용자 생성 성공: {username} ({email_normalized}) - 전화번호: {country_code}{phone_number if phone_number else '없음'}")
         return True, "사용자가 성공적으로 생성되었습니다."
     except sqlite3.IntegrityError:
         return False, "사용자명 또는 이메일이 이미 존재합니다."
@@ -6034,7 +6149,7 @@ def get_user_by_username(username):
     conn = get_db_connection()
     try:
         user = conn.execute('''
-            SELECT id, username, email, password_hash, user_type, is_active, created_at 
+            SELECT id, username, email, password_hash, user_type, is_active, created_at, country_code, phone_number
             FROM users 
             WHERE username = ? 
             LIMIT 1
@@ -6058,7 +6173,7 @@ def get_user_by_email(email):
         
         # 먼저 정확한 이메일로 검색
         user = conn.execute('''
-            SELECT id, username, email, password_hash, user_type, is_active, created_at 
+            SELECT id, username, email, password_hash, user_type, is_active, created_at, country_code, phone_number
             FROM users 
             WHERE LOWER(email) = ? AND is_active = 1
             LIMIT 1
@@ -6083,13 +6198,59 @@ def get_user_by_email(email):
     finally:
         conn.close()
 
-def verify_user_credentials(username_or_email, password):
-    """사용자 인증 정보를 검증하는 함수 (이메일 대소문자 구분 없음)"""
+def get_user_by_phone(country_code, phone_number):
+    """전화번호로 사용자 정보를 조회하는 함수 (활성 계정만)"""
+    if not phone_number or not country_code:
+        return None
+    
+    conn = get_db_connection()
+    try:
+        user = conn.execute('''
+            SELECT id, username, email, password_hash, user_type, is_active, created_at, country_code, phone_number
+            FROM users 
+            WHERE country_code = ? AND phone_number = ? AND is_active = 1
+            LIMIT 1
+        ''', (country_code, phone_number)).fetchone()
+        
+        if user:
+            logging.info(f"전화번호로 사용자 조회 성공: {country_code}{phone_number} -> {user['username']}")
+            return user
+        
+        return None
+        
+    except Exception as e:
+        logging.error(f"전화번호로 사용자 조회 오류: {e}")
+        return None
+    finally:
+        conn.close()
+
+def verify_user_credentials(username_or_email_or_phone, password):
+    """사용자 인증 정보를 검증하는 함수 (사용자명/이메일/전화번호 지원)"""
+    # 전화번호 형식인지 확인 (국가코드 + 전화번호)
+    if username_or_email_or_phone.startswith('+'):
+        # 전화번호로 로그인 시도
+        parts = username_or_email_or_phone.split(' ', 1)
+        if len(parts) == 2:
+            country_code = parts[0]
+            phone_number = parts[1]
+            user = get_user_by_phone(country_code, phone_number)
+            if user:
+                # sqlite3.Row은 dict.get을 지원하지 않으므로 안전하게 처리
+                try:
+                    user_keys = set(user.keys()) if hasattr(user, 'keys') else set()
+                except Exception:
+                    user_keys = set()
+                is_active = user['is_active'] if 'is_active' in user_keys else 1
+                if is_active and check_password_hash(user['password_hash'], password):
+                    logging.info(f"전화번호로 사용자 인증 성공: {user['username']} ({country_code}{phone_number})")
+                    return True, user
+        return False, None
+    
     # 사용자명 또는 이메일로 사용자 찾기
-    user = get_user_by_username(username_or_email)
+    user = get_user_by_username(username_or_email_or_phone)
     if not user:
         # 이메일로 검색 (대소문자 구분 없음)
-        user = get_user_by_email(username_or_email)
+        user = get_user_by_email(username_or_email_or_phone)
     
     if user:
         # sqlite3.Row은 dict.get을 지원하지 않으므로 안전하게 처리
@@ -6102,10 +6263,10 @@ def verify_user_credentials(username_or_email, password):
             logging.info(f"사용자 인증 성공: {user['username']} ({user['email']})")
             return True, user
         else:
-            logging.warning(f"사용자 인증 실패: 비활성 계정 또는 잘못된 비밀번호 - {username_or_email}")
+            logging.warning(f"사용자 인증 실패: 비활성 계정 또는 잘못된 비밀번호 - {username_or_email_or_phone}")
             return False, None
     else:
-        logging.warning(f"사용자 인증 실패: 사용자를 찾을 수 없음 - {username_or_email}")
+        logging.warning(f"사용자 인증 실패: 사용자를 찾을 수 없음 - {username_or_email_or_phone}")
         return False, None
 
 # =====================================
@@ -6331,6 +6492,33 @@ SIGNUP_HTML = '''
             box-shadow: 0 0 0 3px rgba(210, 105, 30, 0.1);
         }
         
+        .phone-group {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+        
+        .country-select {
+            flex: 0 0 120px;
+            padding: 15px 10px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            background: white;
+            cursor: pointer;
+        }
+        
+        .country-select:focus {
+            border-color: #D2691E;
+            outline: none;
+        }
+        
+        .phone-input {
+            flex: 1;
+        }
+        
+
+        
         .submit-btn {
             width: 100%;
             padding: 15px;
@@ -6421,6 +6609,47 @@ SIGNUP_HTML = '''
                     placeholder="example@email.com"
                     required
                 >
+            </div>
+            
+            <div class="form-group">
+                <label for="country_code" class="form-label">국가 코드</label>
+                <select id="country_code" name="country_code" class="country-select">
+                    <option value="">국가를 선택하세요</option>
+                    <option value="+1">🇺🇸 미국/캐나다 (+1)</option>
+                    <option value="+44">🇬🇧 영국 (+44)</option>
+                    <option value="+81">🇯🇵 일본 (+81)</option>
+                    <option value="+86">🇨🇳 중국 (+86)</option>
+                    <option value="+49">🇩🇪 독일 (+49)</option>
+                    <option value="+33">🇫🇷 프랑스 (+33)</option>
+                    <option value="+39">🇮🇹 이탈리아 (+39)</option>
+                    <option value="+34">🇪🇸 스페인 (+34)</option>
+                    <option value="+31">🇳🇱 네덜란드 (+31)</option>
+                    <option value="+46">🇸🇪 스웨덴 (+46)</option>
+                    <option value="+47">🇳🇴 노르웨이 (+47)</option>
+                    <option value="+45">🇩🇰 덴마크 (+45)</option>
+                    <option value="+358">🇫🇮 핀란드 (+358)</option>
+                    <option value="+7">🇷🇺 러시아 (+7)</option>
+                    <option value="+91">🇮🇳 인도 (+91)</option>
+                    <option value="+61">🇦🇺 호주 (+61)</option>
+                    <option value="+64">🇳🇿 뉴질랜드 (+64)</option>
+                    <option value="+55">🇧🇷 브라질 (+55)</option>
+                    <option value="+52">🇲🇽 멕시코 (+52)</option>
+                    <option value="+82">🇰🇷 대한민국 (+82)</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="phone_number" class="form-label">전화번호 (선택사항)</label>
+                <div class="phone-group">
+                    <input 
+                        type="tel" 
+                        id="phone_number" 
+                        name="phone_number" 
+                        class="form-input phone-input"
+                        placeholder="전화번호를 입력하세요"
+                        pattern="[0-9\\-\\s]+"
+                    >
+                </div>
             </div>
             
             <div class="form-group">
@@ -6829,13 +7058,13 @@ LOGIN_HTML = '''
         
         <form method="POST" action="/login">
             <div class="form-group">
-                <label for="username_or_email" class="form-label">사용자명 또는 이메일</label>
+                <label for="username_or_email" class="form-label">사용자명, 이메일 또는 전화번호</label>
                 <input 
                     type="text" 
                     id="username_or_email" 
                     name="username_or_email" 
                     class="form-input"
-                    placeholder="사용자명 또는 이메일을 입력하세요"
+                    placeholder="사용자명, 이메일 또는 전화번호"
                     required
                 >
             </div>
@@ -7381,6 +7610,28 @@ DASHBOARD_HTML = '''
             <div class="welcome-section">
                 <div class="welcome-title">🥩 Cutlet 대시보드</div>
                 <div class="welcome-subtitle">당신의 URL 단축 서비스 현황을 확인하세요 • {usage_text}</div>
+            </div>
+            
+            <div class="user-info-section" style="background: #f8f9fa; padding: 20px; border-radius: 15px; margin-bottom: 30px;">
+                <h3 style="color: #495057; margin-bottom: 15px;">👤 사용자 정보</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                    <div style="background: white; padding: 15px; border-radius: 10px; border-left: 3px solid #D2691E;">
+                        <div style="font-weight: bold; color: #D2691E; margin-bottom: 5px;">사용자명</div>
+                        <div>{username}</div>
+                    </div>
+                    <div style="background: white; padding: 15px; border-radius: 10px; border-left: 3px solid #D2691E;">
+                        <div style="font-weight: bold; color: #D2691E; margin-bottom: 5px;">이메일</div>
+                        <div>{email}</div>
+                    </div>
+                    <div style="background: white; padding: 15px; border-radius: 10px; border-left: 3px solid #D2691E;">
+                        <div style="font-weight: bold; color: #D2691E; margin-bottom: 5px;">전화번호</div>
+                        <div>{phone_display}</div>
+                    </div>
+                    <div style="background: white; padding: 15px; border-radius: 10px; border-left: 3px solid #D2691E;">
+                        <div style="font-weight: bold; color: #D2691E; margin-bottom: 5px;">가입일</div>
+                        <div>{created_at}</div>
+                    </div>
+                </div>
             </div>
             
             <div class="stats-grid">
