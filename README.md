@@ -61,7 +61,31 @@ export FLASK_DEBUG=1
 # 프로덕션 환경
 export FLASK_ENV=production
 export FLASK_DEBUG=0
+
+# 이메일 설정 (비밀번호 찾기 기능)
+export MAIL_USERNAME=your-email@gmail.com
+export MAIL_PASSWORD=your-app-password
+export MAIL_DEFAULT_SENDER=your-email@gmail.com
 ```
+
+#### 📧 Gmail SMTP 설정 방법
+1. **Google 계정 보안 설정**
+   - [Google 계정 설정](https://myaccount.google.com/) → 보안
+   - 2단계 인증 활성화
+
+2. **앱 비밀번호 생성**
+   - 보안 → 앱 비밀번호 → 메일 선택
+   - 생성된 16자리 비밀번호를 `MAIL_PASSWORD`에 입력
+
+3. **환경변수 설정 예시**
+   ```bash
+   export MAIL_SERVER=smtp.gmail.com
+   export MAIL_PORT=587
+   export MAIL_USE_TLS=True
+   export MAIL_USERNAME=your-email@gmail.com
+   export MAIL_PASSWORD=abcd-efgh-ijkl-mnop
+   export MAIL_DEFAULT_SENDER=your-email@gmail.com
+   ```
 
 ### 4. 데이터베이스 초기화
 ```bash

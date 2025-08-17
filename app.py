@@ -12,9 +12,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from config import get_config
 from flask_wtf.csrf import CSRFProtect
+from flask_mail import Mail, Message
 import qrcode
 from io import BytesIO
 import base64
+import uuid
 
 # Flask 애플리케이션 인스턴스 생성
 app = Flask(__name__)
@@ -56,6 +58,9 @@ logging.basicConfig(
     ]
 )
 
+# Flask-Mail 초기화
+mail = Mail(app)
+
 # Flask 앱 시작 로그
 logging.info("🥩 Cutlet URL Shortener starting...")
 logging.info(f"Environment: {os.environ.get('FLASK_ENV', 'development')}")
@@ -63,6 +68,7 @@ logging.info(f"Debug mode: {app.config['DEBUG']}")
 logging.info(f"Database: {DATABASE}")
 logging.info(f"Rate limit: {RATE_LIMIT_PER_MINUTE}/min")
 logging.info(f"Cache size: {CACHE_MAX_SIZE}")
+logging.info(f"Mail server: {app.config['MAIL_SERVER']}:{app.config['MAIL_PORT']}")
 
 # 데이터베이스 연결 함수
 def get_db_connection():
@@ -198,6 +204,22 @@ def create_tables():
             )
         ''')
         
+        # 비밀번호 재설정 토큰 테이블 (비밀번호 찾기 기능)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_reset_token ON password_reset_tokens(token)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_reset_user_id ON password_reset_tokens(user_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_reset_expires ON password_reset_tokens(expires_at)')
+        
         conn.commit()
         print("✅ users 및 urls 테이블과 성능 인덱스가 성공적으로 생성되었습니다.")
     except Exception as e:
@@ -257,6 +279,44 @@ def migrate_database():
             conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
             conn.commit()
             print("✅ users.is_active 마이그레이션 완료")
+        
+        # 비밀번호 재설정 토큰 테이블 확인 및 생성
+        cursor = conn.execute("PRAGMA table_info(password_reset_tokens)")
+        reset_token_columns = [column[1] for column in cursor.fetchall()]
+        
+        if not reset_token_columns:
+            print("🔄 password_reset_tokens 테이블을 생성하는 중...")
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    token TEXT UNIQUE NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    used INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_reset_token ON password_reset_tokens(token)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_reset_user_id ON password_reset_tokens(user_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_reset_expires ON password_reset_tokens(expires_at)')
+            conn.commit()
+            print("✅ password_reset_tokens 테이블 마이그레이션 완료")
+        
+        # 이메일 대소문자 정규화 (기존 이메일을 모두 소문자로 변환)
+        print("🔄 이메일 대소문자 정규화 중...")
+        try:
+            # 모든 사용자의 이메일을 소문자로 변환
+            conn.execute('UPDATE users SET email = LOWER(email) WHERE email != LOWER(email)')
+            updated_count = conn.execute('SELECT changes()').fetchone()[0]
+            if updated_count > 0:
+                conn.commit()
+                print(f"✅ {updated_count}개의 이메일 주소를 소문자로 정규화했습니다.")
+            else:
+                print("✅ 모든 이메일이 이미 소문자로 정규화되어 있습니다.")
+        except Exception as e:
+            print(f"⚠️ 이메일 정규화 중 오류 (무시됨): {e}")
+            # 오류가 발생해도 계속 진행
             
     except Exception as e:
         print(f"❌ 마이그레이션 오류: {e}")
@@ -649,6 +709,128 @@ def is_short_code_exists(short_code):
         return True  # 오류 발생시 안전하게 중복으로 판단
     finally:
         conn.close()
+
+# =====================================
+# 비밀번호 찾기 관련 함수들
+# =====================================
+
+def generate_reset_token():
+    """안전한 비밀번호 재설정 토큰을 생성하는 함수 (UUID 기반)"""
+    return str(uuid.uuid4())
+
+def create_password_reset_token(user_id, email):
+    """사용자 ID와 이메일로 비밀번호 재설정 토큰을 생성하는 함수"""
+    conn = get_db_connection()
+    try:
+        # 기존 토큰이 있으면 만료 처리
+        conn.execute('''
+            UPDATE password_reset_tokens 
+            SET used = 1 
+            WHERE user_id = ? AND used = 0
+        ''', (user_id,))
+        
+        # 새 토큰 생성 (1시간 유효)
+        token = generate_reset_token()
+        expires_at = datetime.datetime.now() + datetime.timedelta(hours=1)
+        
+        conn.execute('''
+            INSERT INTO password_reset_tokens (user_id, token, expires_at)
+            VALUES (?, ?, ?)
+        ''', (user_id, token, expires_at))
+        
+        conn.commit()
+        return token
+    except Exception as e:
+        print(f"❌ 비밀번호 재설정 토큰 생성 오류: {e}")
+        return None
+    finally:
+        conn.close()
+
+def verify_reset_token(token):
+    """비밀번호 재설정 토큰을 검증하는 함수"""
+    conn = get_db_connection()
+    try:
+        result = conn.execute('''
+            SELECT prt.user_id, prt.used, prt.expires_at, u.username, u.email
+            FROM password_reset_tokens prt
+            JOIN users u ON prt.user_id = u.id
+            WHERE prt.token = ? AND prt.used = 0 AND prt.expires_at > datetime('now')
+            LIMIT 1
+        ''', (token,)).fetchone()
+        
+        return result
+    except Exception as e:
+        print(f"❌ 비밀번호 재설정 토큰 검증 오류: {e}")
+        return None
+    finally:
+        conn.close()
+
+def mark_reset_token_used(token):
+    """비밀번호 재설정 토큰을 사용 완료로 표시하는 함수"""
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            UPDATE password_reset_tokens 
+            SET used = 1 
+            WHERE token = ?
+        ''', (token,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ 토큰 사용 완료 표시 오류: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+
+def send_password_reset_email(email, username, reset_url):
+    """비밀번호 재설정 이메일을 발송하는 함수"""
+    try:
+        # 이메일 설정 확인
+        if not app.config['MAIL_USERNAME'] or not app.config['MAIL_PASSWORD']:
+            logging.warning("이메일 설정이 완료되지 않았습니다. 환경변수를 확인해주세요.")
+            return False, "이메일 설정이 완료되지 않았습니다."
+        
+        # 이메일 내용 생성
+        subject = "🥩 Cutlet - 비밀번호 재설정"
+        body = f"""
+안녕하세요, {username}님!
+
+Cutlet에서 비밀번호 재설정을 요청하셨습니다.
+
+아래 링크를 클릭하여 새 비밀번호를 설정해주세요:
+
+🔗 {reset_url}
+
+⚠️ 주의사항:
+• 이 링크는 1시간 동안만 유효합니다
+• 링크를 사용하면 즉시 만료됩니다
+• 비밀번호 재설정을 요청하지 않으셨다면 이 이메일을 무시하세요
+
+감사합니다!
+🥩 Cutlet 팀
+
+---
+이 이메일은 자동으로 발송되었습니다.
+문의사항이 있으시면 관리자에게 연락해주세요.
+        """
+        
+        # 이메일 발송
+        msg = Message(
+            subject=subject,
+            recipients=[email],
+            body=body.strip(),
+            sender=app.config['MAIL_DEFAULT_SENDER'] or app.config['MAIL_USERNAME']
+        )
+        
+        mail.send(msg)
+        logging.info(f"비밀번호 재설정 이메일 발송 성공: {email}")
+        return True, "이메일이 성공적으로 발송되었습니다."
+        
+    except Exception as e:
+        logging.error(f"이메일 발송 오류: {e}")
+        return False, f"이메일 발송 중 오류가 발생했습니다: {str(e)}"
 
 def test_short_code_generation(count=10):
     """단축 코드 생성 알고리즘을 테스트하는 함수"""
@@ -1651,6 +1833,152 @@ def logout():
     """로그아웃 처리"""
     session.clear()
     return redirect('/?message=로그아웃되었습니다.')
+
+# =====================================
+# 비밀번호 찾기 관련 라우트들
+# =====================================
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    """비밀번호 찾기 페이지 (GET: 폼 표시, POST: 이메일 처리)"""
+    
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip()
+        
+        if not email:
+            return render_template_string(FORGOT_PASSWORD_HTML, error="이메일 주소를 입력해주세요.")
+        
+        # 이메일 형식 검증
+        if '@' not in email or '.' not in email:
+            return render_template_string(FORGOT_PASSWORD_HTML, error="올바른 이메일 형식을 입력해주세요.")
+        
+        # 로깅 추가
+        logging.info(f"비밀번호 찾기 요청: {email}")
+        
+        # 사용자 존재 여부 확인
+        user = get_user_by_email(email)
+        if not user:
+            logging.warning(f"비밀번호 찾기 실패: 존재하지 않는 이메일 - {email}")
+            # 보안상 존재하지 않는 이메일이어도 성공 메시지 표시
+            return render_template_string(FORGOT_PASSWORD_HTML, 
+                message="비밀번호 재설정 링크가 전송되었습니다. 이메일을 확인해주세요.")
+        
+        logging.info(f"비밀번호 찾기 성공: 사용자 {user['username']} ({email})")
+        
+        # 비밀번호 재설정 토큰 생성
+        token = create_password_reset_token(user['id'], email)
+        if not token:
+            logging.error(f"토큰 생성 실패: 사용자 {user['username']} ({email})")
+            return render_template_string(FORGOT_PASSWORD_HTML, 
+                error="토큰 생성 중 오류가 발생했습니다. 다시 시도해주세요.")
+        
+        # 실제 이메일 발송
+        base_url = request.host_url.rstrip('/')
+        reset_url = f"{base_url}/reset-password/{token}"
+        
+        # 이메일 발송 시도
+        email_sent, email_message = send_password_reset_email(email, user['username'], reset_url)
+        
+        if email_sent:
+            logging.info(f"비밀번호 재설정 이메일 발송 성공: {email} -> {user['username']}")
+            return render_template_string(FORGOT_PASSWORD_HTML, 
+                message=f"✅ 비밀번호 재설정 이메일이 {email}로 발송되었습니다!<br><br>"
+                       f"📧 이메일을 확인하여 재설정 링크를 클릭하세요.<br>"
+                       f"⏰ 링크는 1시간 동안만 유효합니다.<br><br>"
+                       f"💡 스팸 폴더도 확인해보세요.")
+        else:
+            logging.error(f"이메일 발송 실패: {email} -> {email_message}")
+            # 이메일 발송 실패시 화면에 링크 표시 (개발용)
+            if app.config['DEBUG']:
+                return render_template_string(FORGOT_PASSWORD_HTML, 
+                    message=f"⚠️ 이메일 발송 실패: {email_message}<br><br>"
+                           f"🔗 개발용 재설정 링크:<br>"
+                           f"<div class='reset-link'>{reset_url}</div><br>"
+                           f"위 링크를 클릭하여 비밀번호를 재설정하세요.")
+            else:
+                return render_template_string(FORGOT_PASSWORD_HTML, 
+                    error=f"이메일 발송에 실패했습니다: {email_message}<br><br>"
+                          f"잠시 후 다시 시도하거나 관리자에게 문의해주세요.")
+    
+    # GET 요청시 폼 표시
+    return render_template_string(FORGOT_PASSWORD_HTML)
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    """비밀번호 재설정 페이지 (GET: 폼 표시, POST: 비밀번호 변경)"""
+    
+    # 토큰 검증
+    token_data = verify_reset_token(token)
+    if not token_data:
+        return '''
+        <!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>토큰 오류 - Cutlet</title>
+            <style>
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+                .container { background:white; border-radius:20px; box-shadow:0 20px 40px rgba(0,0,0,0.1); padding:40px; max-width:500px; width:100%; text-align:center; }
+                .error-icon { font-size:4rem; margin-bottom:20px; color:#dc3545; }
+                .error-title { font-size:2rem; color:#333; margin-bottom:20px; }
+                .error-message { color:#666; margin-bottom:30px; }
+                .btn { display:inline-block; padding:15px 30px; background:linear-gradient(135deg,#D2691E 0%,#CD853F 100%); color:white; text-decoration:none; border-radius:10px; font-weight:600; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="error-icon">⚠️</div>
+                <div class="error-title">토큰 오류</div>
+                <div class="error-message">
+                    비밀번호 재설정 링크가 유효하지 않거나 만료되었습니다.<br>
+                    새로운 재설정 링크를 요청해주세요.
+                </div>
+                <a href="/forgot-password" class="btn">🔑 비밀번호 찾기</a>
+            </div>
+        </body>
+        </html>
+        '''
+    
+    if request.method == 'POST':
+        new_password = request.form.get('new_password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        
+        # 입력 검증
+        if not new_password or len(new_password) < 6:
+            return render_template_string(RESET_PASSWORD_HTML, 
+                token=token, username=token_data['username'], email=token_data['email'],
+                error_message='<div class="error-message">⚠️ 새 비밀번호는 최소 6자 이상이어야 합니다.</div>', 
+                success_message='')
+        
+        if new_password != confirm_password:
+            return render_template_string(RESET_PASSWORD_HTML, 
+                token=token, username=token_data['username'], email=token_data['email'],
+                error_message='<div class="error-message">⚠️ 비밀번호가 일치하지 않습니다.</div>', 
+                success_message='')
+        
+        # 비밀번호 변경
+        success, message = update_user_password(token_data['user_id'], new_password)
+        if success:
+            # 토큰 사용 완료 표시
+            mark_reset_token_used(token)
+            
+            return render_template_string(RESET_PASSWORD_HTML, 
+                token=token, username=token_data['username'], email=token_data['email'],
+                error_message='',
+                success_message='<div class="success-message">✅ 비밀번호가 성공적으로 변경되었습니다!<br><br>'
+                               f'<script>setTimeout(function() {{ window.location.href = "/login?message=비밀번호가 변경되었습니다. 새 비밀번호로 로그인해주세요."; }}, 3000);</script>'
+                               f'3초 후 로그인 페이지로 자동 이동합니다...</div>')
+        else:
+            return render_template_string(RESET_PASSWORD_HTML, 
+                token=token, username=token_data['username'], email=token_data['email'],
+                error_message=f'<div class="error-message">⚠️ {message}</div>', 
+                success_message='')
+    
+    # GET 요청시 폼 표시
+    return render_template_string(RESET_PASSWORD_HTML, 
+        token=token, username=token_data['username'], email=token_data['email'],
+        error_message='', success_message='')
 
 # =====================================
 # 개인 대시보드 및 URL 관리 (2-5단계)
@@ -5670,19 +5998,33 @@ curl -X POST http://localhost:8080/shorten \\<br>
 # =====================================
 
 def create_user(username, email, password):
-    """새로운 사용자를 생성하는 함수"""
+    """새로운 사용자를 생성하는 함수 (이메일 소문자 정규화)"""
     conn = get_db_connection()
     try:
+        # 이메일을 소문자로 정규화
+        email_normalized = email.lower().strip()
         password_hash = generate_password_hash(password)
+        
+        # 이메일 중복 체크 (소문자 기준)
+        existing_user = conn.execute('''
+            SELECT username FROM users WHERE LOWER(email) = ?
+        ''', (email_normalized,)).fetchone()
+        
+        if existing_user:
+            return False, f"이미 사용 중인 이메일입니다: {email_normalized}"
+        
         conn.execute('''
             INSERT INTO users (username, email, password_hash, user_type, is_active) 
             VALUES (?, ?, ?, 'free', 1)
-        ''', (username, email, password_hash))
+        ''', (username, email_normalized, password_hash))
         conn.commit()
+        
+        logging.info(f"새 사용자 생성 성공: {username} ({email_normalized})")
         return True, "사용자가 성공적으로 생성되었습니다."
     except sqlite3.IntegrityError:
         return False, "사용자명 또는 이메일이 이미 존재합니다."
     except Exception as e:
+        logging.error(f"사용자 생성 오류: {e}")
         return False, f"사용자 생성 중 오류가 발생했습니다: {str(e)}"
     finally:
         conn.close()
@@ -5705,27 +6047,48 @@ def get_user_by_username(username):
         conn.close()
 
 def get_user_by_email(email):
-    """이메일로 사용자 정보를 조회하는 함수"""
+    """이메일로 사용자 정보를 조회하는 함수 (대소문자 구분 없음, 활성 계정만)"""
+    if not email:
+        return None
+    
     conn = get_db_connection()
     try:
+        # 이메일을 소문자로 변환하여 검색 (대소문자 구분 없음)
+        email_lower = email.lower().strip()
+        
+        # 먼저 정확한 이메일로 검색
         user = conn.execute('''
             SELECT id, username, email, password_hash, user_type, is_active, created_at 
             FROM users 
-            WHERE email = ? 
+            WHERE LOWER(email) = ? AND is_active = 1
             LIMIT 1
-        ''', (email,)).fetchone()
-        return user
+        ''', (email_lower,)).fetchone()
+        
+        if user:
+            logging.info(f"이메일로 사용자 조회 성공: {email} -> {user['username']}")
+            return user
+        
+        # 디버깅을 위한 로그 추가
+        logging.info(f"이메일로 사용자 조회 실패: {email} (소문자 변환: {email_lower})")
+        
+        # 전체 사용자 목록에서 이메일 확인 (디버깅용)
+        all_users = conn.execute('SELECT email, username, is_active FROM users LIMIT 10').fetchall()
+        logging.info(f"데이터베이스의 사용자들: {[{'email': u['email'], 'username': u['username'], 'active': u['is_active']} for u in all_users]}")
+        
+        return None
+        
     except Exception as e:
-        print(f"❌ 사용자 조회 오류: {e}")
+        logging.error(f"이메일로 사용자 조회 오류: {e}")
         return None
     finally:
         conn.close()
 
 def verify_user_credentials(username_or_email, password):
-    """사용자 인증 정보를 검증하는 함수"""
+    """사용자 인증 정보를 검증하는 함수 (이메일 대소문자 구분 없음)"""
     # 사용자명 또는 이메일로 사용자 찾기
     user = get_user_by_username(username_or_email)
     if not user:
+        # 이메일로 검색 (대소문자 구분 없음)
         user = get_user_by_email(username_or_email)
     
     if user:
@@ -5736,10 +6099,13 @@ def verify_user_credentials(username_or_email, password):
             user_keys = set()
         is_active = user['is_active'] if 'is_active' in user_keys else 1
         if is_active and check_password_hash(user['password_hash'], password):
+            logging.info(f"사용자 인증 성공: {user['username']} ({user['email']})")
             return True, user
         else:
+            logging.warning(f"사용자 인증 실패: 비활성 계정 또는 잘못된 비밀번호 - {username_or_email}")
             return False, None
     else:
+        logging.warning(f"사용자 인증 실패: 사용자를 찾을 수 없음 - {username_or_email}")
         return False, None
 
 # =====================================
@@ -6097,6 +6463,213 @@ SIGNUP_HTML = '''
 </html>
 '''
 
+# 비밀번호 찾기 페이지 HTML
+FORGOT_PASSWORD_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>비밀번호 찾기 - Cutlet</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .logo {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #D2691E;
+            margin-bottom: 10px;
+        }
+        
+        .brand-emoji {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 30px;
+        }
+        
+        .description {
+            color: #666;
+            font-size: 1rem;
+            margin-bottom: 30px;
+            line-height: 1.6;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        .form-label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 1rem;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 15px 20px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        
+        .form-input:focus {
+            border-color: #D2691E;
+            box-shadow: 0 0 0 3px rgba(210, 105, 30, 0.1);
+        }
+        
+        .submit-btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(210, 105, 30, 0.3);
+        }
+        
+        .error-message {
+            background: #fee;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+            text-align: left;
+        }
+        
+        .success-message {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #c3e6cb;
+            text-align: left;
+        }
+        
+        .links {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+        
+        .link {
+            display: inline-block;
+            margin: 0 10px;
+            color: #D2691E;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s ease;
+        }
+        
+        .link:hover {
+            color: #CD853F;
+            text-decoration: underline;
+        }
+        
+        .reset-link {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            font-family: monospace;
+            word-break: break-all;
+            font-size: 0.9rem;
+            color: #495057;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 30px 20px;
+                margin: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="brand-emoji">🔑</div>
+        <div class="logo">Cutlet</div>
+        <div class="subtitle">비밀번호 찾기</div>
+        <div class="description">
+            가입하신 이메일 주소를 입력하시면<br>
+            비밀번호 재설정 링크를 보내드립니다.
+        </div>
+        
+        ''' + (f'<div class="error-message">⚠️ {{error}}</div>' if 'error' in locals() else '') + '''
+        ''' + (f'<div class="success-message">✅ {{message}}</div>' if 'message' in locals() else '') + '''
+        
+        <form method="POST" action="/forgot-password">
+            <div class="form-group">
+                <label for="email" class="form-label">이메일 주소</label>
+                <input 
+                    type="email" 
+                    id="email" 
+                    name="email" 
+                    class="form-input"
+                    placeholder="가입하신 이메일을 입력하세요"
+                    required
+                >
+            </div>
+            
+            <button type="submit" class="submit-btn">
+                🔑 재설정 링크 보내기
+            </button>
+        </form>
+        
+        <div class="links">
+            <a href="/login" class="link">🔐 로그인으로 돌아가기</a>
+            <a href="/signup" class="link">📝 회원가입</a>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
 # 로그인 페이지 HTML
 LOGIN_HTML = '''
 <!DOCTYPE html>
@@ -6287,6 +6860,234 @@ LOGIN_HTML = '''
         <div class="links">
             <a href="/" class="link">🏠 메인 페이지</a>
             <a href="/signup" class="link">📝 회원가입</a>
+            <a href="/forgot-password" class="link">🔑 비밀번호를 잊으셨나요?</a>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+# 비밀번호 재설정 페이지 HTML
+RESET_PASSWORD_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>비밀번호 재설정 - Cutlet</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .logo {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #D2691E;
+            margin-bottom: 10px;
+        }
+        
+        .brand-emoji {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 30px;
+        }
+        
+        .description {
+            color: #666;
+            font-size: 1rem;
+            margin-bottom: 30px;
+            line-height: 1.6;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        .form-label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 1rem;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 15px 20px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        
+        .form-input:focus {
+            border-color: #D2691E;
+            box-shadow: 0 0 0 3px rgba(210, 105, 30, 0.1);
+        }
+        
+        .submit-btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #D2691E 0%, #CD853F 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(210, 105, 30, 0.3);
+        }
+        
+        .error-message {
+            background: #fee;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+            text-align: left;
+        }
+        
+        .success-message {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #c3e6cb;
+            text-align: left;
+        }
+        
+        .links {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+        
+        .link {
+            display: inline-block;
+            margin: 0 10px;
+            color: #D2691E;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s ease;
+        }
+        
+        .link:hover {
+            color: #CD853F;
+            text-decoration: underline;
+        }
+        
+        .user-info {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px 0;
+            text-align: left;
+        }
+        
+        .user-info strong {
+            color: #D2691E;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 30px 20px;
+                margin: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="brand-emoji">🔐</div>
+        <div class="logo">Cutlet</div>
+        <div class="subtitle">비밀번호 재설정</div>
+        <div class="description">
+            새로운 비밀번호를 설정해주세요.<br>
+            안전한 비밀번호를 사용하시는 것을 권장합니다.
+        </div>
+        
+        <div class="user-info">
+            <strong>사용자:</strong> {{ username }}<br>
+            <strong>이메일:</strong> {{ email }}
+        </div>
+        
+        {{ error_message | safe }}
+        {{ success_message | safe }}
+        
+        <form method="POST" action="/reset-password/{{ token }}">
+            <div class="form-group">
+                <label for="new_password" class="form-label">새 비밀번호</label>
+                <input 
+                    type="password" 
+                    id="new_password" 
+                    name="new_password" 
+                    class="form-input"
+                    placeholder="새 비밀번호를 입력하세요 (최소 6자)"
+                    required
+                    minlength="6"
+                >
+            </div>
+            
+            <div class="form-group">
+                <label for="confirm_password" class="form-label">새 비밀번호 확인</label>
+                <input 
+                    type="password" 
+                    id="confirm_password" 
+                    name="confirm_password" 
+                    class="form-input"
+                    placeholder="새 비밀번호를 다시 입력하세요"
+                    required
+                    minlength="6"
+                >
+            </div>
+            
+            <button type="submit" class="submit-btn">
+                🔐 비밀번호 변경
+            </button>
+        </form>
+        
+        <div class="links">
+            <a href="/login" class="link">🔐 로그인으로 돌아가기</a>
+            <a href="/" class="link">🏠 메인 페이지</a>
         </div>
     </div>
 </body>

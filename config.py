@@ -33,6 +33,16 @@ class Config:
     # 보안 설정
     MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH') or 1048576)  # 1MB
     
+    # 이메일 설정 (비밀번호 찾기 기능)
+    MAIL_SERVER = os.environ.get('MAIL_SERVER') or 'smtp.gmail.com'
+    MAIL_PORT = int(os.environ.get('MAIL_PORT') or 587)
+    MAIL_USE_TLS = os.environ.get('MAIL_USE_TLS', 'True').lower() == 'true'
+    MAIL_USE_SSL = os.environ.get('MAIL_USE_SSL', 'False').lower() == 'true'
+    MAIL_USERNAME = os.environ.get('MAIL_USERNAME') or ''
+    MAIL_PASSWORD = os.environ.get('MAIL_PASSWORD') or ''
+    MAIL_DEFAULT_SENDER = os.environ.get('MAIL_DEFAULT_SENDER') or ''
+    MAIL_MAX_EMAILS = int(os.environ.get('MAIL_MAX_EMAILS') or 10)
+    
     @staticmethod
     def init_app(app):
         """Flask 앱 초기화"""
