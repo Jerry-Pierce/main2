@@ -3,9 +3,8 @@ const CACHE_NAME = 'cutlet-v1.0.0';
 const STATIC_CACHE = 'cutlet-static-v1.0.0';
 const DYNAMIC_CACHE = 'cutlet-dynamic-v1.0.0';
 
-// 캐시할 정적 파일들
+// 캐시할 정적 파일들 (동적 페이지 '/'는 제외)
 const STATIC_FILES = [
-    '/',
     '/static/icons/icon-192x192.png',
     '/static/icons/icon-512x512.png',
     '/static/icons/shortcut-96x96.png',
@@ -59,79 +58,65 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
     const { request } = event;
     const url = new URL(request.url);
-    
-    // 정적 파일 요청 처리
-    if (STATIC_FILES.includes(url.pathname)) {
-        event.respondWith(
-            caches.match(request)
-                .then((response) => {
-                    if (response) {
-                        console.log('📦 캐시에서 응답:', url.pathname);
-                        return response;
-                    }
-                    
-                    // 캐시에 없으면 네트워크에서 가져오고 캐시에 저장
-                    return fetch(request)
-                        .then((response) => {
-                            if (response.status === 200) {
-                                const responseClone = response.clone();
-                                caches.open(STATIC_CACHE)
-                                    .then((cache) => {
-                                        cache.put(request, responseClone);
-                                    });
-                            }
-                            return response;
-                        });
-                })
-        );
-        return;
-    }
-    
-    // API 요청은 네트워크 우선, 실패 시 캐시 확인
-    if (url.pathname.startsWith('/shorten') || url.pathname.startsWith('/api/')) {
+
+    // 1) HTML 문서는 항상 네트워크 우선 (세션 기반 동적 컨텐츠 보장)
+    if (request.destination === 'document') {
         event.respondWith(
             fetch(request)
+                .then((response) => {
+                    // 성공하면 동적 캐시에 저장
+                    if (response.status === 200 && request.method === 'GET') {
+                        const responseClone = response.clone();
+                        caches.open(DYNAMIC_CACHE).then((cache) => cache.put(request, responseClone));
+                    }
+                    return response;
+                })
                 .catch(() => {
-                    // 네트워크 실패 시 오프라인 페이지 표시
-                    return caches.match('/offline.html');
+                    // 네트워크 실패 시 캐시된 페이지 또는 오프라인 페이지 반환
+                    return caches.match(request).then((cached) => cached || caches.match('/offline.html'));
                 })
         );
         return;
     }
-    
-    // 일반 페이지 요청은 네트워크 우선, 실패 시 캐시 확인
+
+    // 2) 정적 파일은 캐시 우선
+    if (STATIC_FILES.includes(url.pathname)) {
+        event.respondWith(
+            caches.match(request).then((response) => {
+                if (response) {
+                    return response;
+                }
+                return fetch(request).then((netRes) => {
+                    if (netRes.status === 200) {
+                        const clone = netRes.clone();
+                        caches.open(STATIC_CACHE).then((cache) => cache.put(request, clone));
+                    }
+                    return netRes;
+                });
+            })
+        );
+        return;
+    }
+
+    // 3) API는 네트워크 우선
+    if (url.pathname.startsWith('/shorten') || url.pathname.startsWith('/api/')) {
+        event.respondWith(
+            fetch(request).catch(() => caches.match('/offline.html'))
+        );
+        return;
+    }
+
+    // 4) 그 외 요청은 기존 네트워크 우선
     event.respondWith(
         fetch(request)
             .then((response) => {
-                // 성공한 응답을 동적 캐시에 저장
                 if (response.status === 200 && request.method === 'GET') {
                     const responseClone = response.clone();
-                    caches.open(DYNAMIC_CACHE)
-                        .then((cache) => {
-                            cache.put(request, responseClone);
-                        });
+                    caches.open(DYNAMIC_CACHE).then((cache) => cache.put(request, responseClone));
                 }
                 return response;
             })
-            .catch(() => {
-                // 네트워크 실패 시 캐시에서 찾기
-                return caches.match(request)
-                    .then((response) => {
-                        if (response) {
-                            return response;
-                        }
-                        
-                        // 캐시에도 없으면 오프라인 페이지
-                        if (request.destination === 'document') {
-                            return caches.match('/offline.html');
-                        }
-                        
-                        return new Response('오프라인 모드입니다.', {
-                            status: 503,
-                            statusText: 'Service Unavailable'
-                        });
-                    });
-            })
+            .catch(() => caches.match(request))
     );
 });
 

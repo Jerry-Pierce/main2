@@ -29,15 +29,13 @@ app.config.from_object(config_class)
 # 세션 보안을 위한 시크릿 키 설정
 app.secret_key = app.config.get('SECRET_KEY', 'cutlet-secret-key-change-in-production')
 
-# 세션 설정 (브라우저 세션 기반 - 창을 닫을 때까지 유지)
+# 세션 설정 (영구 세션)
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=365)  # 1년간 세션 유지
 app.config['SESSION_COOKIE_SECURE'] = False  # HTTP에서도 쿠키 허용 (개발용)
-app.config['SESSION_COOKIE_HTTPONLY'] = False  # JavaScript에서 쿠키 접근 허용 (디버깅용)
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # JavaScript에서 쿠키 접근 방지
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF 방지
-app.config['SESSION_COOKIE_MAX_AGE'] = None  # 브라우저 세션 기반 (창을 닫을 때까지)
-app.config['SESSION_REFRESH_EACH_REQUEST'] = True  # 매 요청마다 세션 갱신
+app.config['SESSION_COOKIE_MAX_AGE'] = timedelta(days=365)  # 영구 세션과 일치
 app.config['SESSION_COOKIE_PATH'] = '/'  # 모든 경로에서 쿠키 접근 가능
-app.config['SESSION_COOKIE_DOMAIN'] = None  # 모든 도메인에서 쿠키 접근 가능
 
 # CSRF 보호 비활성화 (render_template_string 사용으로 인해)
 # csrf = CSRFProtect(app)
@@ -72,20 +70,13 @@ logging.basicConfig(
 # Flask-Mail 초기화
 mail = Mail(app)
 
-# 세션 갱신 미들웨어
+# 세션 디버깅 미들웨어 (개발용)
 @app.before_request
 def before_request():
-    """모든 요청 전에 세션을 갱신하는 미들웨어"""
-    print(f"🔍 요청 URL: {request.url}")
-    print(f"🔍 요청 메서드: {request.method}")
-    print(f"🔍 세션 내용: {dict(session)}")
-    
-    if session.get('logged_in'):
-        session.permanent = True
-        session.modified = True
-        print(f"✅ 세션 갱신됨: user_id={session.get('user_id')}, username={session.get('username')}")
-    else:
-        print(f"❌ 로그인되지 않은 사용자")
+    """요청 전 세션 상태 로깅 (개발용)"""
+    if app.config['DEBUG']:
+        print(f"🔍 요청: {request.method} {request.url}")
+        print(f"🔍 세션: logged_in={session.get('logged_in')}, user_id={session.get('user_id')}")
 
 # Flask 앱 시작 로그
 logging.info("🥩 Cutlet URL Shortener starting...")
@@ -202,9 +193,6 @@ def create_tables():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_adclk_short_code ON ad_clicks(short_code)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_adclk_created_at ON ad_clicks(created_at)')
         
-        # 결제 인덱스 보강
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at)')
-
         # 결제/구독 기반 테이블 (3-4단계)
         conn.execute('''
             CREATE TABLE IF NOT EXISTS payments (
@@ -218,6 +206,10 @@ def create_tables():
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
             )
         ''')
+        
+        # 결제 인덱스 보강
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at)')
+        
         conn.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -393,42 +385,18 @@ def generate_csrf_token():
     """CSRF 토큰을 생성하는 함수"""
     if 'csrf_token' not in session:
         session['csrf_token'] = ''.join(random.choices('0123456789abcdef', k=32))
-        session.modified = True  # 세션 수정을 명시적으로 표시
     return session['csrf_token']
 
 def is_logged_in():
     """사용자가 로그인되어 있는지 확인하는 함수"""
-    # 세션에서 확인
-    session_logged_in = session.get('logged_in', False)
-    session_user_id = session.get('user_id')
-    session_username = session.get('username')
+    logged_in = session.get('logged_in', False)
+    user_id = session.get('user_id')
+    username = session.get('username')
     
-    # 쿠키에서도 확인
-    cookie_logged_in = request.cookies.get('logged_in') == 'true'
-    cookie_user_id = request.cookies.get('user_id')
-    cookie_username = request.cookies.get('username')
-    
-    print(f"🔍 세션 확인: session_logged_in={session_logged_in}, session_user_id={session_user_id}, session_username={session_username}")
-    print(f"🔍 쿠키 확인: cookie_logged_in={cookie_logged_in}, cookie_user_id={cookie_user_id}, cookie_username={cookie_username}")
-    
-    # 세션이나 쿠키 중 하나라도 유효하면 로그인된 것으로 간주
-    if (session_logged_in and session_user_id and session_username) or (cookie_logged_in and cookie_user_id and cookie_username):
-        # 세션이 없으면 쿠키에서 복원
-        if not session_logged_in and cookie_logged_in:
-            session['logged_in'] = True
-            session['user_id'] = int(cookie_user_id)
-            session['username'] = cookie_username
-            session['last_activity'] = datetime.datetime.now().isoformat()
-            session.modified = True
-            print(f"✅ 세션을 쿠키에서 복원: user_id={cookie_user_id}, username={cookie_username}")
-        
-        # 마지막 활동 시간 업데이트
-        session['last_activity'] = datetime.datetime.now().isoformat()
-        session.modified = True
-        
+    # 세션 정보가 모두 있는지 확인
+    if logged_in and user_id and username:
         return True
     else:
-        print(f"❌ 로그인 확인 실패")
         return False
 
 def get_current_user():
@@ -1925,27 +1893,17 @@ def login():
         success, user = verify_user_credentials(username_or_email, password)
         
         if success:
-            # 세션을 영구적으로 설정하고 강제로 저장
+            # 세션을 영구적으로 설정
             session.permanent = True
             session['logged_in'] = True
             session['user_id'] = user['id']
             session['username'] = user['username']
             session['email'] = user['email']
             session['login_time'] = datetime.datetime.now().isoformat()
-            session['last_activity'] = datetime.datetime.now().isoformat()
             
             print(f"✅ 로그인 성공: user_id={user['id']}, username={user['username']}, session.permanent={session.permanent}")
             
-            # 세션을 강제로 저장
-            session.modified = True
-            
-            # 응답에 쿠키 직접 설정
-            response = redirect('/?message=로그인되었습니다.')
-            response.set_cookie('user_id', str(user['id']), max_age=365*24*60*60, httponly=False, secure=False, samesite='Lax')
-            response.set_cookie('username', user['username'], max_age=365*24*60*60, httponly=False, secure=False, samesite='Lax')
-            response.set_cookie('logged_in', 'true', max_age=365*24*60*60, httponly=False, secure=False, samesite='Lax')
-            
-            return response
+            return redirect('/?message=로그인되었습니다.')
         else:
             return render_template_string(LOGIN_HTML, error="사용자명/이메일 또는 비밀번호가 올바르지 않습니다.")
     
@@ -1958,12 +1916,7 @@ def login():
 def logout():
     """로그아웃 처리"""
     session.clear()
-    response = redirect('/?message=로그아웃되었습니다.')
-    # 쿠키도 클리어
-    response.delete_cookie('user_id')
-    response.delete_cookie('username')
-    response.delete_cookie('logged_in')
-    return response
+    return redirect('/?message=로그아웃되었습니다.')
 
 # =====================================
 # 비밀번호 찾기 관련 라우트들
