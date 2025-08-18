@@ -385,7 +385,7 @@ def get_current_user():
     conn = get_db_connection()
     try:
         user = conn.execute('''
-            SELECT id, username, email, user_type, is_active, created_at 
+            SELECT id, username, email, user_type, is_active, created_at, country_code, phone_number
             FROM users 
             WHERE id = ? 
             LIMIT 1
@@ -2103,7 +2103,7 @@ def dashboard():
     
     # 가입일 안전하게 설정 (4-4단계 수정)
     try:
-        if current_user.get('created_at'):
+        if 'created_at' in current_user.keys() and current_user['created_at']:
             created_at = current_user['created_at'][:10] if isinstance(current_user['created_at'], str) else 'N/A'
         else:
             created_at = 'N/A'
@@ -2126,16 +2126,16 @@ def dashboard():
                     </button>
                     ''' if is_premium else ''
     
-    # 전화번호 마스킹 처리
+    # 전화번호 마스킹 처리 (안전하게 처리)
     phone_display = mask_phone_number(
-        current_user['country_code'],
-        current_user['phone_number']
+        current_user['country_code'] if 'country_code' in current_user.keys() else None,
+        current_user['phone_number'] if 'phone_number' in current_user.keys() else None
     )
     
     # HTML 템플릿에 변수 전달
     dashboard_html = DASHBOARD_HTML.format(
         username=current_user['username'],
-        email=current_user.get('email', 'N/A'),
+        email=current_user['email'] if 'email' in current_user.keys() else 'N/A',
         phone_display=phone_display,
         created_at=created_at,
         total_urls=total_urls,
